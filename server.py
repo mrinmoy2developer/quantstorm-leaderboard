@@ -38,6 +38,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+from contextlib import asynccontextmanager
 import asyncio
 import io
 import itertools
@@ -82,14 +83,14 @@ MAX_ACTIVE_SLOTS = 10        # strategies one connection may run concurrently; r
 #: match can never occupy more than max_concurrent - RESERVED_LOW_SLOTS
 #: slots at once, so a qualifying newcomer always has headroom to start
 #: playing regardless of how many experienced matches are queued.
-RESERVED_LOW_SLOTS = 20
+RESERVED_LOW_SLOTS = 5
 
 #: Bumped whenever matchup.py's wire behavior changes in a way worth
 #: flagging to participants still running an older download -- purely
 #: informational, never enforced: a mismatched or missing version (every
 #: bundle downloaded before this field existed) still connects and plays
 #: exactly as before, just shows a "stale bundle" tag on the dashboard.
-CURRENT_CLIENT_VERSION = 1
+CURRENT_CLIENT_VERSION = 2
 
 #: Matches an entrant needs before their PnL/match is trusted enough to rank
 #: on. A late joiner isn't disadvantaged by the SCHEDULE -- _schedule_missing
@@ -641,6 +642,11 @@ class Ladder:
         self.match_semaphore: asyncio.Semaphore | None = None
         self.high_match_semaphore: asyncio.Semaphore | None = None
         self.live_matches: dict = {}   # match_id -> {"a":..., "b":...}
+        # Pairings already admitted to the scheduler.  Keeping these bounded
+        # prevents every 15-second scheduler tick from adding another copy of
+        # the same slow match behind a semaphore.
+        self.pending_matches: set[tuple[str, str]] = set()
+        self.pending_entrants: set[str] = set()
         self.client_zip = build_client_zip()
 
     # ── websocket handling ──────────────────────────────────
@@ -789,6 +795,10 @@ class Ladder:
                 "ranked": len(ranked),
                 "in_queue": len(connected_ids - persisted_ids),
                 "rejected": rejected,
+                "active_matches": len(self.live_matches),
+                "pending_matches": len(self.pending_matches),
+                "low_match_capacity": self.max_concurrent,
+                "high_match_capacity": max(1, self.max_concurrent - RESERVED_LOW_SLOTS),
             },
         })
 
@@ -918,20 +928,65 @@ class Ladder:
         # matches queued in an earlier tick still drains in that tick's order
         # first.
         ready.sort(key=self._schedule_key)
+        # Admit at most one pending match per entrant and never more than the
+        # configured worker count.  A match can take minutes, so admitting
+        # every combination every 15 seconds otherwise creates a large pile
+        # of duplicate tasks waiting behind the semaphores.
+        capacity = max(0, self.max_concurrent - len(self.pending_matches))
+        started = 0
         for (sa, fa), (sb, fb) in itertools.combinations(ready, 2):
+            if started >= capacity:
+                break
             ida, idb = entrant_id(sa.name, fa), entrant_id(sb.name, fb)
             if ida == idb:
                 # Same player, same file selected twice over -- not a match.
                 continue
+            if ida in self.pending_entrants or idb in self.pending_entrants:
+                continue
             if self.board.games_played(ida, idb) >= self.matches_per_pair:
                 continue
-            asyncio.create_task(self.run_match(sa, fa, sb, fb))
+            pair_key = tuple(sorted((ida, idb)))
+            if pair_key in self.pending_matches:
+                continue
+            self.pending_matches.add(pair_key)
+            self.pending_entrants.update((ida, idb))
+            asyncio.create_task(self._run_scheduled_match(
+                sa, fa, sb, fb, pair_key, ida, idb))
+            started += 1
+
+    async def _run_scheduled_match(self, sa, fa, sb, fb, pair_key, ida, idb):
+        try:
+            await self.run_match(sa, fa, sb, fb)
+        finally:
+            self.pending_matches.discard(pair_key)
+            self.pending_entrants.discard(ida)
+            self.pending_entrants.discard(idb)
+            # The next match should start as soon as a slot becomes free,
+            # not up to ROUND_INTERVAL_S later. _schedule_missing sorts
+            # zero-match entrants first, so this gives new participants the
+            # first available slot without interrupting a live game.
+            try:
+                await self._schedule_missing()
+            except Exception as e:
+                print(f"[scheduler] completion-triggered scheduling failed: {e}")
+
+    @asynccontextmanager
+    async def _match_capacity(self, low_match: bool):
+        # The shared semaphore enforces the total -- the category semaphore
+        # only reserves headroom for low-track-record entrants.  The old code
+        # acquired independent semaphores, allowing low + established games
+        # to exceed max_concurrent.
+        async with self.match_semaphore:
+            if low_match:
+                yield
+            else:
+                async with self.high_match_semaphore:
+                    yield
 
     async def run_match(self, sa: Session, fa: str, sb: Session, fb: str):
         low_match = (self._matches_so_far(sa, fa) <= LOW_MATCH_THRESHOLD
                      or self._matches_so_far(sb, fb) <= LOW_MATCH_THRESHOLD)
-        semaphore = self.match_semaphore if low_match else self.high_match_semaphore
-        async with semaphore:
+        async with self._match_capacity(low_match):
             slot_a, slot_b = sa.slots.get(fa), sb.slots.get(fb)
             if slot_a is None or slot_b is None:
                 return  # deselected between scheduling and now
@@ -1099,8 +1154,17 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
           overflow: hidden; }
   .scroll { overflow-x: auto; }
-  .scroll-tall { max-height: 420px; overflow-y: auto; }
+  .scroll-tall { max-height: min(70vh, 720px); overflow-y: auto; }
   .scroll-tall thead th { position: sticky; top: 0; z-index: 1; }
+  details.table-section { margin: 2.4rem 0 .7rem; }
+  details.table-section > summary { cursor: pointer; list-style: none; color: var(--dim);
+       font-size: .78rem; text-transform: uppercase; letter-spacing: .07em; font-weight: 600; }
+  details.table-section > summary::-webkit-details-marker { display: none; }
+  details.table-section > summary::before { content: '▸ '; color: var(--accent); }
+  details.table-section[open] > summary::before { content: '▾ '; }
+  details.table-section > .lede { margin: .45rem 0 .7rem; }
+  .table-scroll { max-height: min(70vh, 720px); overflow: auto; }
+  .table-scroll thead th { position: sticky; top: 0; z-index: 1; }
   table { width: 100%; border-collapse: collapse; min-width: 480px; }
   th, td { padding: .6rem .9rem; text-align: right; border-bottom: 1px solid var(--line); }
   th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3)
@@ -1236,30 +1300,34 @@ full breakdown of everything you've entered stays on your own private dashboard.
   </div>
 </details>
 
-<h2>Standings</h2>
+<details class="table-section" open>
+<summary>Standings</summary>
 <p class="lede" id="rank-note"></p>
-<div class="card scroll"><table id="standings">
+<div class="card table-scroll"><table id="standings">
   <thead><tr><th>#</th><th>Entrant</th><th>College</th><th>Bot</th><th>Matches</th><th>Avg/Match</th><th>Score</th></tr></thead>
   <tbody></tbody>
-</table></div>
+</table></div></details>
 
-<h2>Still building a track record</h2>
-<div class="card scroll"><table id="provisional">
+<details class="table-section" open>
+<summary>Still building a track record</summary>
+<div class="card table-scroll"><table id="provisional">
   <thead><tr><th>Entrant</th><th>College</th><th>Bot</th><th>Matches</th><th>Avg/Match so far</th></tr></thead>
   <tbody></tbody>
-</table></div>
+</table></div></details>
 
-<h2>Connected strategies</h2>
-<div class="card scroll scroll-tall"><table id="slots">
+<details class="table-section">
+<summary>Connected strategies</summary>
+<div class="card table-scroll"><table id="slots">
   <thead><tr><th>Player</th><th>College</th><th>Bot</th><th>Status</th><th>Connected</th></tr></thead>
   <tbody></tbody>
-</table></div>
+</table></div></details>
 
-<h2>Recent matches</h2>
-<div class="card scroll"><table id="matches">
+<details class="table-section" open>
+<summary>Recent matches</summary>
+<div class="card table-scroll"><table id="matches">
   <thead><tr><th>When</th><th>Entrant A</th><th>PnL</th><th>Entrant B</th><th>PnL</th></tr></thead>
   <tbody></tbody>
-</table></div>
+</table></div></details>
 
 <footer>Your strategy code is never uploaded — matchup.py only ever ships per-turn decisions.
 This server and client are open source:
@@ -1421,6 +1489,14 @@ PLAYER_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   tbody tr:last-child td { border-bottom: none; }
   .pnl-pos { color: var(--pos); font-weight: 600; } .pnl-neg { color: var(--neg); font-weight: 600; }
   .pnl-zero { color: var(--dim); }
+  details.table-section { margin: 2rem 0 .6rem; }
+  details.table-section > summary { cursor: pointer; list-style: none; font-size: .78rem;
+       text-transform: uppercase; letter-spacing: .07em; color: var(--dim); font-weight: 600; }
+  details.table-section > summary::-webkit-details-marker { display: none; }
+  details.table-section > summary::before { content: '▸ '; color: var(--accent); }
+  details.table-section[open] > summary::before { content: '▾ '; }
+  .table-scroll { max-height: min(70vh, 720px); overflow: auto; margin-top: .6rem; }
+  .table-scroll thead th { position: sticky; top: 0; z-index: 1; background: var(--panel-alt); }
 
   .analytics-head { display: flex; align-items: center; justify-content: space-between;
                      flex-wrap: wrap; gap: .5rem; margin: 2rem 0 .6rem; }
@@ -1448,11 +1524,12 @@ PLAYER_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <p class="foot">Only file names are shown here — your code stays on your machine. Up to
 <b id="cap">4</b> run at once; the rest queue and activate automatically as slots free up.</p>
 
-<h2>Your scores</h2>
-<div class="card" style="padding:0"><table id="myscores">
+<details class="table-section" open>
+<summary>Your scores</summary>
+<div class="card table-scroll" style="padding:0"><table id="myscores">
   <thead><tr><th>Strategy</th><th>Matches</th><th>Avg/Match</th><th>PnL</th></tr></thead>
   <tbody></tbody>
-</table></div>
+</table></div></details>
 
 <div class="analytics-head">
   <h2 style="margin-top:0">Analytics</h2>

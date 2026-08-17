@@ -50,7 +50,7 @@ SERVER_URL = "wss://quantstorm.mrinmoy.org/ws"
 #: participants about. Purely informational: an older or missing version
 #: still connects and plays exactly the same, the server just tags it
 #: "stale bundle" on the dashboard so the participant knows to update.
-CLIENT_VERSION = 1
+CLIENT_VERSION = 2
 
 # Works whether this file sits in ladder/ next to the rest of the repo (dev
 # layout: engine.py etc. one directory up) or standalone, as unzipped from
@@ -153,6 +153,12 @@ class Client:
         # re-enter exactly this set through the same select endpoint the
         # browser dashboard uses.
         self.selected: set[str] = set()
+        # The WebSocket reader must stay free to receive RPCs for other
+        # selected strategies. Each filename has its own sandbox process,
+        # so calls for different filenames can execute in parallel; a lock
+        # keeps the (normally serial) calls for one sandbox ordered.
+        self._rpc_tasks: dict[str, set[asyncio.Task]] = {}
+        self._rpc_locks: dict[str, asyncio.Lock] = {}
 
     def dashboard_url(self, dashboard_path: str) -> str:
         base = self.server.replace("wss://", "https://").replace("ws://", "http://")
@@ -181,7 +187,9 @@ class Client:
 
     async def handle_unload_bot(self, filename: str):
         self.selected.discard(filename)
+        await self._finish_rpc_tasks(filename)
         entry = self.running.pop(filename, None)
+        self._rpc_locks.pop(filename, None)
         if entry is not None:
             entry.sandboxed.close()
         print(f"  ↺ {filename} withdrawn from the ladder")
@@ -195,11 +203,14 @@ class Client:
         path = self.strategies_dir / filename
         sandboxed = SandboxedBot(path, filename, config)
         self.running[filename] = RunningStrategy(sandboxed, config)
+        self._rpc_locks[filename] = asyncio.Lock()
         print(f"\n▶ {filename} vs {data.get('opponent')} starting")
 
     async def handle_match_end(self, data: dict):
         filename = data["filename"]
+        await self._finish_rpc_tasks(filename)
         entry = self.running.pop(filename, None)
+        self._rpc_locks.pop(filename, None)
         if entry is not None:
             entry.sandboxed.close()
         if "error" in data:
@@ -216,10 +227,37 @@ class Client:
         method = data["method"]
         args = data["args"]
         try:
-            value = self._call_local_bot(method, args)
+            filename = args.get("filename")
+            lock = self._rpc_locks.get(filename)
+            if lock is None:
+                raise RuntimeError(f"no active match for {filename!r}")
+            async with lock:
+                value = await asyncio.to_thread(self._call_local_bot, method, args)
             await self.send({"type": "rpc_result", "id": req_id, "ok": True, "value": value})
         except Exception as e:
             await self.send({"type": "rpc_result", "id": req_id, "ok": False, "error": str(e)})
+
+    def dispatch_rpc(self, data: dict):
+        """Run a bot call without blocking WebSocket reads for other bots."""
+        filename = data.get("args", {}).get("filename", "")
+        task = asyncio.create_task(self.handle_rpc(data))
+        tasks = self._rpc_tasks.setdefault(filename, set())
+        tasks.add(task)
+
+        def done(completed: asyncio.Task, name: str = filename):
+            active = self._rpc_tasks.get(name)
+            if active is None:
+                return
+            active.discard(completed)
+            if not active:
+                self._rpc_tasks.pop(name, None)
+
+        task.add_done_callback(done)
+
+    async def _finish_rpc_tasks(self, filename: str):
+        tasks = tuple(self._rpc_tasks.get(filename, ()))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _call_local_bot(self, method: str, args: dict):
         filename = args.get("filename")
@@ -302,7 +340,7 @@ class Client:
                             elif kind == "match_start":
                                 await self.handle_match_start(data)
                             elif kind == "rpc":
-                                await self.handle_rpc(data)
+                                self.dispatch_rpc(data)
                             elif kind == "match_end":
                                 await self.handle_match_end(data)
                             elif kind == "identity_note":
@@ -314,6 +352,13 @@ class Client:
             finally:
                 self.ws = None
                 self.http = None
+                pending = [task for tasks in self._rpc_tasks.values() for task in tasks]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                self._rpc_tasks.clear()
+                self._rpc_locks.clear()
                 for entry in self.running.values():
                     entry.sandboxed.close()
                 self.running.clear()

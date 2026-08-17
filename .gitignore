@@ -1,0 +1,20 @@
+# Runtime state — real participant data (names, colleges, roll numbers),
+# never belongs in the repo.
+leaderboard_data.json
+leaderboard_data.json.tmp
+server.log
+server.pid
+
+# The game engine itself is a separate, organizer-owned repo — see README.
+# If you copy those files in locally to run this, don't commit them here.
+engine.py
+game_config.py
+sandbox.py
+policy.py
+limits.py
+bot_loader.py
+
+__pycache__/
+*.pyc
+.venv/
+.DS_Store

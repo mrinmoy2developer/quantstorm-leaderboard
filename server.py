@@ -76,6 +76,14 @@ RPC_TIMEOUT_S = 8.0          # generous network/IPC allowance, NOT the 50ms game
 ROUND_INTERVAL_S = 15.0      # how often the auto-scheduler looks for missing pairings
 MAX_ACTIVE_SLOTS = 10        # strategies one connection may run concurrently; rest queue
 
+#: Of the concurrent match slots, this many are reserved for matches where
+#: at least one side's bot has LOW_MATCH_THRESHOLD or fewer completed games
+#: (the dashboard's "In queue" and provisional entrants). An established
+#: match can never occupy more than max_concurrent - RESERVED_LOW_SLOTS
+#: slots at once, so a qualifying newcomer always has headroom to start
+#: playing regardless of how many experienced matches are queued.
+RESERVED_LOW_SLOTS = 5
+
 #: Bumped whenever matchup.py's wire behavior changes in a way worth
 #: flagging to participants still running an older download -- purely
 #: informational, never enforced: a mismatched or missing version (every
@@ -91,6 +99,11 @@ CURRENT_CLIENT_VERSION = 1
 #: Below this many matches an entrant shows up as "provisional" instead of
 #: in the ranked standings.
 MIN_MATCHES_FOR_RANK = 10
+
+#: A bot at or below this match count is "low" and entitled to the reserved
+#: slots above. Same figure as MIN_MATCHES_FOR_RANK: below it a strategy
+#: cannot rank yet and most needs to play.
+LOW_MATCH_THRESHOLD = MIN_MATCHES_FOR_RANK
 
 #: The shipped baseline strategies (adaptive_bidder.py, naive_ev.py,
 #: rational.py) all carry this exact roll number in their header comment.
@@ -601,6 +614,7 @@ class Ladder:
         self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
         self.max_concurrent = max_concurrent
         self.match_semaphore: asyncio.Semaphore | None = None
+        self.high_match_semaphore: asyncio.Semaphore | None = None
         self.live_matches: dict = {}   # match_id -> {"a":..., "b":...}
         self.client_zip = build_client_zip()
 
@@ -859,21 +873,26 @@ class Ladder:
         row = self.board.entrants.get(entrant_id(session.name, filename))
         return row["matches"] if row else 0
 
+    def _schedule_key(self, sf) -> tuple:
+        matches = self._matches_so_far(*sf)
+        return (0, matches) if matches == 0 else (1, matches)
+
     async def _schedule_missing(self):
         ready = [
             (s, f) for s in self.sessions.values() if s.connected
             for f, slot in s.slots.items() if slot.status == "ready" and not slot.busy
         ]
-        # Fewest-matches-first: a brand new entrant behind combinations() of
-        # every already-established pair could wait ticks before its first
-        # game runs, at exactly the moment it most needs matches to reach
-        # MIN_MATCHES_FOR_RANK. Sorting first means combinations() naturally
-        # produces low-match pairs earlier, and since tasks acquire
-        # match_semaphore in the order they're created, they get first crack
-        # at the available concurrency each tick. Best-effort, not a hard
-        # guarantee -- a semaphore already saturated by matches queued in an
-        # earlier tick still drains in that tick's order first.
-        ready.sort(key=lambda sf: self._matches_so_far(*sf))
+        # Zero-matches-first, then fewest-matches-first: a connected-and-ready
+        # entrant that has never completed a game -- the dashboard's "In queue"
+        # bucket -- must not wait behind every already-established pair, at
+        # exactly the moment it most needs matches to reach MIN_MATCHES_FOR_RANK.
+        # Sorting first means combinations() naturally produces these pairs
+        # earlier, and since tasks acquire match_semaphore in the order they're
+        # created, they get first crack at the available concurrency each tick.
+        # Best-effort, not a hard guarantee -- a semaphore already saturated by
+        # matches queued in an earlier tick still drains in that tick's order
+        # first.
+        ready.sort(key=self._schedule_key)
         for (sa, fa), (sb, fb) in itertools.combinations(ready, 2):
             ida, idb = entrant_id(sa.name, fa), entrant_id(sb.name, fb)
             if ida == idb:
@@ -884,7 +903,10 @@ class Ladder:
             asyncio.create_task(self.run_match(sa, fa, sb, fb))
 
     async def run_match(self, sa: Session, fa: str, sb: Session, fb: str):
-        async with self.match_semaphore:
+        low_match = (self._matches_so_far(sa, fa) <= LOW_MATCH_THRESHOLD
+                     or self._matches_so_far(sb, fb) <= LOW_MATCH_THRESHOLD)
+        semaphore = self.match_semaphore if low_match else self.high_match_semaphore
+        async with semaphore:
             slot_a, slot_b = sa.slots.get(fa), sb.slots.get(fb)
             if slot_a is None or slot_b is None:
                 return  # deselected between scheduling and now
@@ -1028,6 +1050,20 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   .explain-body b { color: var(--text); }
   .explain-body code { background: var(--panel-alt); border: 1px solid var(--line); border-radius: 4px;
                         padding: .05rem .35rem; color: var(--text); }
+  details.submit { background: #14221a; border: 1px solid #2c5a3f; border-radius: 10px;
+                   margin: 1.4rem 0; padding: .2rem 1rem; }
+  details.submit summary { cursor: pointer; padding: .8rem 0; font-weight: 600; font-size: .92rem;
+                            list-style: none; color: var(--pos); }
+  details.submit summary::-webkit-details-marker { display: none; }
+  details.submit summary::before { content: '▸ '; }
+  details.submit[open] summary::before { content: '▾ '; }
+  .submit-body { padding: 0 0 1rem; color: #cfe8da; font-size: .88rem; line-height: 1.7; }
+  .submit-body ol { margin: .3rem 0; padding-left: 1.3rem; }
+  .submit-body li { margin: .45rem 0; }
+  .submit-body b { color: #e7e9ee; }
+  .submit-body a { color: var(--pos); }
+  .submit-body code { background: #1d2b24; border: 1px solid #2c5a3f; border-radius: 4px;
+                      padding: .05rem .35rem; color: #cfe8da; }
   .stat-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
                padding: .8rem 1rem; }
   .stat-card .label { color: var(--dimmer); font-size: .68rem; text-transform: uppercase;
@@ -1080,6 +1116,28 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <h1>Divided <span class="ring">Oracle</span> — Open Leaderboard</h1>
   <span class="live-badge"><span class="live-dot"></span>live, updates every few seconds</span>
 </header>
+<details class="submit" open>
+  <summary>How to submit &amp; enter the ladder</summary>
+  <div class="submit-body">
+    <ol>
+      <li><b>Download the client</b> — <a href="/download/matchup-client.zip">⬇ matchup-client.zip</a>
+        and unzip it next to your <code>strategies/</code> folder.</li>
+      <li>Make sure your strategy file opens with the mandatory header —
+        <code># Name:</code>, <code># College:</code>, <code># Roll Number:</code> — filled in with
+        your real details. This is also your leaderboard identity; leave it blank and the client
+        won't start.</li>
+      <li>Install the one dependency: <code>pip install aiohttp</code></li>
+      <li>Run it:
+        <code>python matchup.py --strategies /path/to/your/strategies</code></li>
+      <li>Open the <b>private dashboard link it prints</b> and pick which of your bots to enter —
+        only file names are shown, your code never leaves your machine.</li>
+      <li>Keep <code>matchup.py</code> running — the server round-robins you against every other
+        connected entrant automatically, and the leaderboard updates live.</li>
+    </ol>
+    <p>If the connection ever drops (server restart, wifi blip), <code>matchup.py</code> reconnects
+    on its own and re-enters your selected bots — no action needed on your side.</p>
+  </div>
+</details>
 <div class="notice">
   <b>This is not the official leaderboard.</b> It's an unofficial practice ladder built by
   me for informal matches between participants — not affiliated with or endorsed by
@@ -1094,10 +1152,7 @@ full breakdown of everything you've entered stays on your own private dashboard.
   <a class="dl-button" href="/download/matchup-client.zip">⬇ Download the client (matchup.py)</a>
   <a class="gh-button" href="https://github.com/mrinmoy2developer/quantstorm-leaderboard" target="_blank" rel="noopener">↗ Open source on GitHub</a>
 </p>
-<p class="lede">Unzip it next to your <code>strategies/</code> folder, then:</p>
-<p class="lede"><code>pip install aiohttp<br>python matchup.py --strategies /path/to/your/strategies</code></p>
-<p class="lede">No name to type — it's read straight off the mandatory
-<code># Name:</code> header comment in your own strategy files.</p>
+<p class="lede">Full setup steps are under "How to submit &amp; enter the ladder" below.</p>
 
 <div class="stat-row" id="stats"></div>
 
@@ -1171,7 +1226,7 @@ full breakdown of everything you've entered stays on your own private dashboard.
 
 <h2>Connected strategies</h2>
 <div class="card scroll scroll-tall"><table id="slots">
-  <thead><tr><th>Player</th><th>College</th><th>Bot</th><th>Status</th><th>Connected</th><th># Active</th></tr></thead>
+  <thead><tr><th>Player</th><th>College</th><th>Bot</th><th>Status</th><th>Connected</th></tr></thead>
   <tbody></tbody>
 </table></div>
 
@@ -1219,7 +1274,7 @@ function renderSlotsTable(){
   });
 
   if (groups.size === 0) {
-    tbody.innerHTML = '<tr class="empty"><td colspan=6>Nobody connected right now.</td></tr>';
+    tbody.innerHTML = '<tr class="empty"><td colspan=5>Nobody connected right now.</td></tr>';
     return;
   }
 
@@ -1228,6 +1283,7 @@ function renderSlotsTable(){
     const open = expandedGroups.has(key);
     const anyStale = g.rows.some(r => r.stale);
     const anyPlaying = g.rows.some(r => r.status === 'playing');
+    const anyReady = g.rows.some(r => r.status === 'ready');
 
     const head = document.createElement('tr');
     head.className = 'group-row';
@@ -1235,10 +1291,9 @@ function renderSlotsTable(){
       `<td class="player-name"><span class="chevron">${open ? '▾' : '▸'}</span> ${g.name}</td>`+
       `<td class="college">${g.college || '—'}</td>`+
       `<td class="mono">${g.rows.length} strateg${g.rows.length === 1 ? 'y' : 'ies'}</td>`+
-      `<td>${anyPlaying ? '<span class="status-pill"><span class="dot dot-playing"></span>playing</span>' : ''}`+
+      `<td>${anyPlaying ? '<span class="status-pill"><span class="dot dot-playing"></span>playing</span>' : (anyReady ? '<span class="status-pill"><span class="dot dot-ready"></span>ready</span>' : '')}`+
         `${anyStale ? ' <span class="stale-badge">stale bundle</span>' : ''}</td>`+
-      `<td>${fmtAgo(Math.min(...g.rows.map(r => r.connected_at)))}</td>`+
-      `<td>${g.rows.length}</td>`;
+      `<td>${fmtAgo(Math.min(...g.rows.map(r => r.connected_at)))}</td>`;
     head.addEventListener('click', () => {
       if (expandedGroups.has(key)) expandedGroups.delete(key); else expandedGroups.add(key);
       renderSlotsTable();
@@ -1253,7 +1308,7 @@ function renderSlotsTable(){
         row.innerHTML =
           `<td></td><td></td><td class="mono">${p.bot}</td>`+
           `<td><span class="status-pill"><span class="dot dot-${p.status}"></span>${p.status}</span>${stale}</td>`+
-          `<td>${fmtAgo(p.connected_at)}</td><td></td>`;
+          `<td>${fmtAgo(p.connected_at)}</td>`;
         tbody.appendChild(row);
       });
     }
@@ -1625,6 +1680,8 @@ def build_app(ladder: Ladder) -> web.Application:
 
     async def on_startup(app):
         ladder.match_semaphore = asyncio.Semaphore(ladder.max_concurrent)
+        ladder.high_match_semaphore = asyncio.Semaphore(
+            max(1, ladder.max_concurrent - RESERVED_LOW_SLOTS))
         app["scheduler_task"] = asyncio.create_task(ladder.scheduler_loop())
 
     app.on_startup.append(on_startup)

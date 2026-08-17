@@ -132,9 +132,8 @@ def _match_detail(result, seat: int, powers_won: list) -> dict:
     for d in result.deals:
         rounds = [
             {
-                "round": c.round,
+                **protocol.serialize_contract(c),
                 "pnl": (d.score - c.price) if c.long_seat == seat else (c.price - d.score),
-                "forced": c.forced,
             }
             for c in d.contracts
         ]

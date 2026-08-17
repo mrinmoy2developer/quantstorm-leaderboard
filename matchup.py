@@ -46,6 +46,12 @@ import aiohttp
 #: connecting to the same server is the whole point of an open leaderboard.
 SERVER_URL = "wss://quantstorm.mrinmoy.org/ws"
 
+#: Bumped whenever this file's wire behavior changes in a way worth telling
+#: participants about. Purely informational: an older or missing version
+#: still connects and plays exactly the same, the server just tags it
+#: "stale bundle" on the dashboard so the participant knows to update.
+CLIENT_VERSION = 1
+
 # Works whether this file sits in ladder/ next to the rest of the repo (dev
 # layout: engine.py etc. one directory up) or standalone, as unzipped from
 # the leaderboard's "download the client" bundle (flat layout: everything in
@@ -274,7 +280,8 @@ class Client:
                         self.ws = ws
                         await self.send({
                             "type": "hello", "name": self.name, "college": self.college,
-                            "roll_number": self.roll_number, "bots": bots,
+                            "roll_number": self.roll_number, "client_version": CLIENT_VERSION,
+                            "bots": bots,
                         })
 
                         async for msg in ws:

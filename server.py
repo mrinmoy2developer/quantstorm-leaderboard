@@ -74,7 +74,14 @@ STATE_FILE = LADDER_DIR / "leaderboard_data.json"
 
 RPC_TIMEOUT_S = 8.0          # generous network/IPC allowance, NOT the 50ms game limit
 ROUND_INTERVAL_S = 15.0      # how often the auto-scheduler looks for missing pairings
-MAX_ACTIVE_SLOTS = 4         # strategies one connection may run concurrently; rest queue
+MAX_ACTIVE_SLOTS = 10        # strategies one connection may run concurrently; rest queue
+
+#: Bumped whenever matchup.py's wire behavior changes in a way worth
+#: flagging to participants still running an older download -- purely
+#: informational, never enforced: a mismatched or missing version (every
+#: bundle downloaded before this field existed) still connects and plays
+#: exactly as before, just shows a "stale bundle" tag on the dashboard.
+CURRENT_CLIENT_VERSION = 1
 
 #: Matches an entrant needs before their PnL/match is trusted enough to rank
 #: on. A late joiner isn't disadvantaged by the SCHEDULE -- _schedule_missing
@@ -154,6 +161,7 @@ class Session:
     loop: asyncio.AbstractEventLoop
     college: str = ""
     roll_number: str = ""
+    client_version: int = 0    # 0 = older bundle, predates this field entirely
     bots: list = field(default_factory=list)          # metadata only: filenames discovered locally
     slots: dict = field(default_factory=dict)          # filename -> Slot, one per selected strategy
     connected: bool = True
@@ -625,18 +633,33 @@ class Ladder:
                     # when its socket closes -- see the finally block below.
                     college = str(data.get("college", "")).strip()[:80]
                     roll_number = str(data.get("roll_number", "")).strip()[:40]
+                    try:
+                        client_version = int(data.get("client_version", 0))
+                    except (TypeError, ValueError):
+                        client_version = 0
                     canon_name, canon_college, mismatch = self.board.canonicalize(
                         roll_number, name, college)
 
                     token = uuid.uuid4().hex[:16]
                     session = Session(name=canon_name, token=token, ws=ws, loop=loop,
                                        college=canon_college, roll_number=roll_number,
+                                       client_version=client_version,
                                        bots=list(data.get("bots", []))[:200])
                     self.sessions[token] = session
                     await session.send({
                         "type": "welcome", "token": token,
                         "dashboard_path": f"/player/{token}",
                     })
+                    if client_version < CURRENT_CLIENT_VERSION:
+                        await session.send({
+                            "type": "identity_note",
+                            "message": (
+                                f"You're running an older matchup.py bundle — it still works "
+                                f"fine, but a newer one is available from the dashboard's "
+                                f"download button. You'll show up tagged \"stale bundle\" on "
+                                f"the leaderboard until you update."
+                            ),
+                        })
                     if mismatch:
                         print(f"[identity] roll {roll_number}: header says "
                               f"'{name}' / '{college}', keeping the name on record: "
@@ -694,6 +717,7 @@ class Ladder:
                     "name": s.name, "college": s.college, "bot": filename,
                     "status": "playing" if slot.busy else slot.status,
                     "error": slot.error,
+                    "stale": s.client_version < CURRENT_CLIENT_VERSION,
                 })
 
         persisted_ids = {
@@ -760,6 +784,7 @@ class Ladder:
             "name": session.name, "college": session.college, "bots": session.bots,
             "slots": slots, "max_active_slots": MAX_ACTIVE_SLOTS,
             "my_scores": my_scores,
+            "stale_bundle": session.client_version < CURRENT_CLIENT_VERSION,
         })
 
     async def player_select(self, request: web.Request) -> web.Response:
@@ -1017,6 +1042,9 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   .dot-ready { background: var(--ready); } .dot-busy, .dot-playing { background: var(--busy); }
   .dot-idle, .dot-validating { background: var(--idle); } .dot-invalid { background: var(--neg); }
   .dot-queued { background: var(--queued); }
+  .stale-badge { font-size: .65rem; text-transform: uppercase; letter-spacing: .04em;
+                 padding: .1rem .45rem; border-radius: 1rem; background: rgba(240,192,64,.14);
+                 color: var(--accent); border: 1px solid rgba(240,192,64,.35); cursor: help; }
   .empty { color: var(--dimmer); text-align: center; padding: 1.6rem; font-style: italic; }
   .empty td { text-align: center; }
   footer { margin-top: 3rem; color: var(--dimmer); font-size: .78rem; }
@@ -1179,9 +1207,10 @@ async function refresh(){
 
   document.querySelector('#slots tbody').innerHTML = d.slots.map(p=>{
     const dot = 'dot-' + p.status;
+    const stale = p.stale ? ' <span class="stale-badge" title="Running an older matchup.py — still works fine, just missing recent features">stale bundle</span>' : '';
     return `<tr><td class="player-name">${p.name}</td><td class="college">${p.college||'—'}</td>`+
       `<td class="mono">${p.bot}</td>`+
-      `<td><span class="status-pill"><span class="dot ${dot}"></span>${p.status}</span></td></tr>`;
+      `<td><span class="status-pill"><span class="dot ${dot}"></span>${p.status}</span>${stale}</td></tr>`;
   }).join('') || '<tr class="empty"><td colspan=4>Nobody connected right now.</td></tr>';
 
   document.querySelector('#matches tbody').innerHTML = d.recent_matches.map(m=>
@@ -1447,7 +1476,9 @@ async function refresh(){
   const nActive = d.slots.filter(s => s.status==='ready' || s.status==='validating').length;
   document.getElementById('status').innerHTML =
     `Connected as <b>${d.name}</b> (${d.college||'no college given'}). ` +
-    `${nActive} of ${d.max_active_slots} active slots in use.`;
+    `${nActive} of ${d.max_active_slots} active slots in use.` +
+    (d.stale_bundle ? ' <span class="err">Running an older matchup.py — still works, but grab '+
+      'the latest from the dashboard\'s download button when you can.</span>' : '');
 
   document.getElementById('bots').innerHTML = d.bots.map(b=>{
     const slot = byFile[b];

@@ -85,6 +85,17 @@ MAX_ACTIVE_SLOTS = 4         # strategies one connection may run concurrently; r
 #: in the ranked standings.
 MIN_MATCHES_FOR_RANK = 10
 
+#: The shipped baseline strategies (adaptive_bidder.py, naive_ev.py,
+#: rational.py) all carry this exact roll number in their header comment.
+#: It is never a real person's roll number, so it must never be allowed to
+#: anchor an identity -- matchup.py already excludes the whole placeholder
+#: name from its own identity detection, but this is the server-side
+#: backstop for anyone still connecting with an older client: without it,
+#: every distinct participant whose folder still resolves to this shared
+#: placeholder would be permanently merged into one fake "person" by
+#: canonicalize() below, which is worse than doing no canonicalization at all.
+PLACEHOLDER_ROLL_NUMBER = "REF-000"
+
 
 def entrant_id(player: str, filename: str) -> str:
     return f"{player}::{Path(filename).stem}"
@@ -330,11 +341,12 @@ class Leaderboard:
         True when this hello's own header disagreed with the one on record,
         so the caller can tell the connecting client what happened.
 
-        A blank roll number (header present but that field left empty)
-        cannot anchor anything -- falls back to trusting name/college as
-        given, same as before this existed.
+        A blank roll number (header present but that field left empty), or
+        the shipped-baseline placeholder roll number, cannot anchor
+        anything -- falls back to trusting name/college as given, same as
+        before this existed.
         """
-        if not roll_number:
+        if not roll_number or roll_number == PLACEHOLDER_ROLL_NUMBER:
             return name, college, False
         known = self.identities.get(roll_number)
         if known is None:
@@ -946,6 +958,15 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
                color: #1a1a1a; font-weight: 700; font-size: .85rem; padding: .55rem 1rem;
                border-radius: 7px; text-decoration: none; }
   .dl-button:hover { filter: brightness(1.08); }
+  .gh-button { display: inline-flex; align-items: center; gap: .4rem; background: transparent;
+               color: var(--text); font-weight: 600; font-size: .85rem; padding: .55rem 1rem;
+               border: 1px solid var(--line); border-radius: 7px; text-decoration: none; }
+  .gh-button:hover { border-color: var(--dim); background: var(--panel-alt); }
+  .notice { border: 1px solid #6b5416; background: #3a2e0d; border-radius: 10px;
+            padding: .9rem 1.1rem; margin: 1rem 0 1.4rem; font-size: .88rem;
+            line-height: 1.6; color: #e7e9ee; }
+  .notice b { color: var(--accent); }
+  .notice a { color: var(--accent); text-decoration: underline; }
   .stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
               gap: .7rem; margin: 1.4rem 0; }
   details.explain { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
@@ -1005,11 +1026,19 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   <h1>Divided <span class="ring">Oracle</span> — Open Leaderboard</h1>
   <span class="live-badge"><span class="live-dot"></span>live, updates every few seconds</span>
 </header>
+<div class="notice">
+  <b>This is not the official leaderboard.</b> It's an unofficial practice ladder built by
+  me for informal matches between participants — not affiliated with or endorsed by
+  the competition organizers, and your position here has no bearing on the official result.
+  The official leaderboard is at
+  <a href="https://divided-oracle-lb.proudcoast-aaefed12.centralindia.azurecontainerapps.io/" target="_blank" rel="noopener">divided-oracle-lb.proudcoast-aaefed12.centralindia.azurecontainerapps.io</a>.
+</div>
 <p class="lede">Round robin, auto-scheduled. Bot code never touches this server — only per-turn
 decisions do. Score is each entrant's best PnL/match among their qualifying strategies — the
 full breakdown of everything you've entered stays on your own private dashboard.</p>
 <p class="lede">
   <a class="dl-button" href="/download/matchup-client.zip">⬇ Download the client (matchup.py)</a>
+  <a class="gh-button" href="https://github.com/mrinmoy2developer/quantstorm-leaderboard" target="_blank" rel="noopener">↗ Open source on GitHub</a>
 </p>
 <p class="lede">Unzip it next to your <code>strategies/</code> folder, then:</p>
 <p class="lede"><code>pip install aiohttp<br>python matchup.py --strategies /path/to/your/strategies</code></p>
@@ -1098,7 +1127,9 @@ full breakdown of everything you've entered stays on your own private dashboard.
   <tbody></tbody>
 </table></div>
 
-<footer>Your strategy code is never uploaded — matchup.py only ever ships per-turn decisions.</footer>
+<footer>Your strategy code is never uploaded — matchup.py only ever ships per-turn decisions.
+This server and client are open source:
+<a href="https://github.com/mrinmoy2developer/quantstorm-leaderboard" target="_blank" rel="noopener">github.com/mrinmoy2developer/quantstorm-leaderboard</a></footer>
 </div>
 <script>
 function fmtPnl(v){

@@ -71,6 +71,19 @@ def discover_bots(strategies_dir: Path) -> list[str]:
     )
 
 
+#: adaptive_bidder.py, naive_ev.py and rational.py -- the shipped baselines
+#: every participant starts with -- all carry this EXACT header, roll number
+#: included. It is not any real person's identity, ever, so it must never be
+#: eligible to win identity detection: unlike an ordinary alphabetical-first
+#: mixup (fixed by the majority vote below), keeping 2+ of these three
+#: unedited in a strategies/ folder makes them an outright majority on their
+#: own, and because the roll number matches too, the server's roll-number
+#: canonicalizer would otherwise permanently merge every such participant
+#: into one shared fake "person" -- which is worse than the bug it was
+#: built to fix.
+_PLACEHOLDER_NAME = "Quantstorm Reference Bot"
+
+
 def read_candidate_metadata(strategies_dir: Path, bot_files: list[str]) -> dict:
     """Pull Name / College / Roll Number off the mandatory header comments.
 
@@ -78,21 +91,17 @@ def read_candidate_metadata(strategies_dir: Path, bot_files: list[str]) -> dict:
     three lines, so the folder already carries the identity a --name flag
     would otherwise ask you to retype.
 
-    Takes a MAJORITY vote across every file that has one filled in, rather
-    than just the alphabetically-first hit. starter_bot.py and the shipped
-    baselines (adaptive_bidder.py, naive_ev.py, rational.py) all carry
-    "# Name: Quantstorm Reference Bot", and if a participant keeps those
-    sitting in the same strategies/ folder as their own work, one of them
-    can sort before every file of theirs -- which used to lock the whole
-    session onto the reference bot's identity instead of the participant's.
-    A real entrant's own variants of one submission are expected to agree
-    on their real name, so whichever name shows up on the most files wins.
+    Takes a MAJORITY vote across every file that has one filled in AND isn't
+    the shipped-baseline placeholder (see _PLACEHOLDER_NAME), rather than
+    just the alphabetically-first hit. A real entrant's own variants of one
+    submission are expected to agree on their real name, so whichever real
+    name shows up on the most files wins.
     """
     hits: list[tuple[str, dict]] = []
     for filename in bot_files:
         result: CheckResult = check_source(strategies_dir / filename)
         name = result.metadata.get("Name")
-        if name:
+        if name and name != _PLACEHOLDER_NAME:
             hits.append((filename, result))
 
     if not hits:
@@ -320,13 +329,14 @@ def main():
     meta = read_candidate_metadata(strategies_dir, bots)
     if not meta:
         sys.exit(
-            f"error: none of the {len(bots)} .py file(s) in {strategies_dir} have a "
-            f"filled-in '# Name:' header yet. RULEBOOK.md SS12 requires every "
-            f"strategies/*.py to start with\n"
+            f"error: none of the {len(bots)} .py file(s) in {strategies_dir} have YOUR "
+            f"own filled-in '# Name:' header yet -- only the shipped baseline placeholder "
+            f"('{_PLACEHOLDER_NAME}') was found, if anything. RULEBOOK.md SS12 requires "
+            f"every strategies/*.py to start with\n"
             f"    # Name: Your Name\n    # College: Your College\n"
             f"    # Roll Number: Your Roll Number\n"
-            f"Fill that in on at least one file, then retry -- that's also where your "
-            f"leaderboard name comes from, no --name flag needed."
+            f"Fill that in with YOUR OWN details on at least one file, then retry -- "
+            f"that's also where your leaderboard name comes from, no --name flag needed."
         )
     print(f"Identified as '{meta['name']}' ({meta['college'] or 'no college given'}) "
           f"from {meta['source_file']}")

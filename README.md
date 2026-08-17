@@ -30,20 +30,25 @@ tooling for practice matches between rounds.
 
 ## Dependency: the game itself
 
-This repo deliberately does **not** bundle the game engine
-(`engine.py`, `game_config.py`, `sandbox.py`, `policy.py`, `limits.py`,
-`bot_loader.py`) — that's the competition organizers' code, already public
-at **https://github.com/vishwasmiddha/quantstorm-ps**, and it's not this
-project's to redistribute a copy of. To run either `server.py` or
-`matchup.py`, copy those six files from that repo into this directory (or
-point `PYTHONPATH` at a checkout of it) first.
+This repo deliberately does **not** vendor the game engine (`engine.py`,
+`game_config.py`, `sandbox.py`, `policy.py`, `limits.py`, `bot_loader.py`) —
+that's the competition organizers' code, at
+**https://github.com/vishwasmiddha/quantstorm-ps**. That repo is public but
+carries no `LICENSE` file, which means it's viewable/forkable on GitHub but
+not something this project has permission to redistribute a copy of
+elsewhere. `fetch_engine.sh` downloads those six files straight from
+upstream instead — a dependency fetch, not a vendored copy — so run that
+once before either `server.py` or `matchup.py`:
+
+```bash
+./fetch_engine.sh
+```
 
 ## Running the client (most participants want this)
 
 ```bash
 pip install aiohttp
-# copy engine.py, game_config.py, sandbox.py, policy.py, limits.py,
-# bot_loader.py from quantstorm-ps into this directory, then:
+./fetch_engine.sh
 python matchup.py --strategies /path/to/your/strategies
 ```
 
@@ -68,7 +73,7 @@ the server's concurrency cap; the rest queue automatically).
 
 ```bash
 pip install -r requirements.txt
-# same engine-file copy step as above
+./fetch_engine.sh
 python server.py --host 0.0.0.0 --port 8765
 ```
 

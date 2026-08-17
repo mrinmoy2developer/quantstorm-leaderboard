@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -44,7 +45,7 @@ import aiohttp
 
 #: The one and only ladder this client talks to. Not a flag: every entrant
 #: connecting to the same server is the whole point of an open leaderboard.
-SERVER_URL = "wss://quantstorm.mrinmoy.org/ws"
+SERVER_URL = os.environ.get("QUANTSTORM_SERVER_URL", "wss://quantstorm.mrinmoy.org/ws")
 
 #: Bumped whenever this file's wire behavior changes in a way worth telling
 #: participants about. Purely informational: an older or missing version

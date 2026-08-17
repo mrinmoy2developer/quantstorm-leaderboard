@@ -1063,7 +1063,14 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   .dot-queued { background: var(--queued); }
   .stale-badge { font-size: .65rem; text-transform: uppercase; letter-spacing: .04em;
                  padding: .1rem .45rem; border-radius: 1rem; background: rgba(240,192,64,.14);
-                 color: var(--accent); border: 1px solid rgba(240,192,64,.35); cursor: help; }
+                 color: var(--accent); border: 1px solid rgba(240,192,64,.35); cursor: help;
+                 white-space: nowrap; display: inline-block; }
+  #slots th:nth-child(4), #slots td:nth-child(4) { min-width: 13rem; }
+  .group-row { cursor: pointer; }
+  .group-row:hover { background: var(--panel-alt); }
+  .chevron { display: inline-block; width: 1em; color: var(--dimmer); }
+  .group-detail td.mono { padding-left: 1.6rem; }
+  .group-detail:hover { background: var(--panel-alt); }
   .empty { color: var(--dimmer); text-align: center; padding: 1.6rem; font-style: italic; }
   .empty td { text-align: center; }
   footer { margin-top: 3rem; color: var(--dimmer); font-size: .78rem; }
@@ -1190,6 +1197,69 @@ function fmtAgo(ts){
   return Math.floor(s/3600)+'h ago';
 }
 function medal(i){ return i===0?'🥇':i===1?'🥈':i===2?'🥉':(i+1); }
+
+// Connected strategies: grouped by entrant, collapsed by default. Rebuilt
+// with createElement + addEventListener rather than inline onclick="" with
+// interpolated names/colleges -- those are arbitrary participant text (an
+// apostrophe in a college name would do exactly what broke the private
+// dashboard earlier: terminate a string mid-attribute and take the rest of
+// the page's script with it).
+let lastSlots = [];
+const expandedGroups = new Set();
+
+function slotGroupKey(p){ return p.name + ' ' + p.college; }
+
+function renderSlotsTable(){
+  const tbody = document.querySelector('#slots tbody');
+  const groups = new Map();
+  lastSlots.forEach(p => {
+    const key = slotGroupKey(p);
+    if (!groups.has(key)) groups.set(key, {name: p.name, college: p.college, rows: []});
+    groups.get(key).rows.push(p);
+  });
+
+  if (groups.size === 0) {
+    tbody.innerHTML = '<tr class="empty"><td colspan=6>Nobody connected right now.</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = '';
+  for (const [key, g] of groups) {
+    const open = expandedGroups.has(key);
+    const anyStale = g.rows.some(r => r.stale);
+    const anyPlaying = g.rows.some(r => r.status === 'playing');
+
+    const head = document.createElement('tr');
+    head.className = 'group-row';
+    head.innerHTML =
+      `<td class="player-name"><span class="chevron">${open ? '▾' : '▸'}</span> ${g.name}</td>`+
+      `<td class="college">${g.college || '—'}</td>`+
+      `<td class="mono">${g.rows.length} strateg${g.rows.length === 1 ? 'y' : 'ies'}</td>`+
+      `<td>${anyPlaying ? '<span class="status-pill"><span class="dot dot-playing"></span>playing</span>' : ''}`+
+        `${anyStale ? ' <span class="stale-badge">stale bundle</span>' : ''}</td>`+
+      `<td>${fmtAgo(Math.min(...g.rows.map(r => r.connected_at)))}</td>`+
+      `<td>${g.rows.length}</td>`;
+    head.addEventListener('click', () => {
+      if (expandedGroups.has(key)) expandedGroups.delete(key); else expandedGroups.add(key);
+      renderSlotsTable();
+    });
+    tbody.appendChild(head);
+
+    if (open) {
+      g.rows.forEach(p => {
+        const row = document.createElement('tr');
+        row.className = 'group-detail';
+        const stale = p.stale ? ' <span class="stale-badge">stale bundle</span>' : '';
+        row.innerHTML =
+          `<td></td><td></td><td class="mono">${p.bot}</td>`+
+          `<td><span class="status-pill"><span class="dot dot-${p.status}"></span>${p.status}</span>${stale}</td>`+
+          `<td>${fmtAgo(p.connected_at)}</td><td></td>`;
+        tbody.appendChild(row);
+      });
+    }
+  }
+}
+
 async function refresh(){
   const r = await fetch('/api/state'); const d = await r.json();
 
@@ -1224,14 +1294,8 @@ async function refresh(){
     `<td>${fmtPnl(e.avg_pnl)}</td></tr>`
   ).join('') || '<tr class="empty"><td colspan=5>Nobody in the on-ramp right now.</td></tr>';
 
-  document.querySelector('#slots tbody').innerHTML = d.slots.map(p=>{
-    const dot = 'dot-' + p.status;
-    const stale = p.stale ? ' <span class="stale-badge" title="Running an older matchup.py — still works fine, just missing recent features">stale bundle</span>' : '';
-    return `<tr><td class="player-name">${p.name}</td><td class="college">${p.college||'—'}</td>`+
-      `<td class="mono">${p.bot}</td>`+
-      `<td><span class="status-pill"><span class="dot ${dot}"></span>${p.status}</span>${stale}</td>`+
-      `<td>${fmtAgo(p.connected_at)}</td><td>${p.num_active}</td></tr>`;
-  }).join('') || '<tr class="empty"><td colspan=6>Nobody connected right now.</td></tr>';
+  lastSlots = d.slots;
+  renderSlotsTable();
 
   document.querySelector('#matches tbody').innerHTML = d.recent_matches.map(m=>
     `<tr><td>${fmtAgo(m.ts)}</td><td class="mono">${m.a}</td><td>${fmtPnl(m.pnl_a)}</td>`+

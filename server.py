@@ -77,6 +77,12 @@ RPC_TIMEOUT_S = 8.0          # generous network/IPC allowance, NOT the 50ms game
 ROUND_INTERVAL_S = 15.0      # how often the auto-scheduler looks for missing pairings
 MAX_ACTIVE_SLOTS = 10        # strategies one connection may run concurrently; rest queue
 
+# A local sandbox can occasionally exceed its usual budget during cold starts
+# or garbage collection.  Keep the engine's per-call 50ms hard stop, but allow
+# a few more such transient failures before scoring the whole match as a
+# forfeit.  The engine forfeits only after this count is exceeded.
+LADDER_MAX_TIME_VIOLATIONS = 10
+
 #: Of the concurrent match slots, this many are reserved for matches where
 #: at least one side's bot has LOW_MATCH_THRESHOLD or fewer completed games
 #: (the dashboard's "In queue" and provisional entrants). An established
@@ -634,7 +640,7 @@ class Ladder:
         # entrant_id() ("<player>::<bot>") is what actually disambiguates.
         self.sessions: dict[str, Session] = {}      # token -> Session
         self.board = Leaderboard(STATE_FILE)
-        self.config = GameConfig()
+        self.config = GameConfig(MAX_TIME_VIOLATIONS=LADDER_MAX_TIME_VIOLATIONS)
         self.n_deals = n_deals
         self.matches_per_pair = matches_per_pair
         self.executor = ThreadPoolExecutor(max_workers=max_concurrent)

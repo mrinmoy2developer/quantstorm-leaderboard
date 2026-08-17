@@ -1478,7 +1478,7 @@ async function refresh(){
     `Connected as <b>${d.name}</b> (${d.college||'no college given'}). ` +
     `${nActive} of ${d.max_active_slots} active slots in use.` +
     (d.stale_bundle ? ' <span class="err">Running an older matchup.py — still works, but grab '+
-      'the latest from the dashboard\'s download button when you can.</span>' : '');
+      'the latest from the download button on the leaderboard when you can.</span>' : '');
 
   document.getElementById('bots').innerHTML = d.bots.map(b=>{
     const slot = byFile[b];

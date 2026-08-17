@@ -82,7 +82,7 @@ MAX_ACTIVE_SLOTS = 10        # strategies one connection may run concurrently; r
 #: match can never occupy more than max_concurrent - RESERVED_LOW_SLOTS
 #: slots at once, so a qualifying newcomer always has headroom to start
 #: playing regardless of how many experienced matches are queued.
-RESERVED_LOW_SLOTS = 5
+RESERVED_LOW_SLOTS = 10
 
 #: Bumped whenever matchup.py's wire behavior changes in a way worth
 #: flagging to participants still running an older download -- purely

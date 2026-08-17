@@ -164,6 +164,7 @@ class Session:
     client_version: int = 0    # 0 = older bundle, predates this field entirely
     bots: list = field(default_factory=list)          # metadata only: filenames discovered locally
     slots: dict = field(default_factory=dict)          # filename -> Slot, one per selected strategy
+    connected_at: float = field(default_factory=time.time)
     connected: bool = True
     pending: dict = field(default_factory=dict)         # req_id -> asyncio.Future
     _counter: itertools.count = field(default_factory=itertools.count)
@@ -718,6 +719,8 @@ class Ladder:
                     "status": "playing" if slot.busy else slot.status,
                     "error": slot.error,
                     "stale": s.client_version < CURRENT_CLIENT_VERSION,
+                    "connected_at": s.connected_at,
+                    "num_active": len(s.slots),
                 })
 
         persisted_ids = {
@@ -1035,6 +1038,8 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
   .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
           overflow: hidden; }
   .scroll { overflow-x: auto; }
+  .scroll-tall { max-height: 420px; overflow-y: auto; }
+  .scroll-tall thead th { position: sticky; top: 0; z-index: 1; }
   table { width: 100%; border-collapse: collapse; min-width: 480px; }
   th, td { padding: .6rem .9rem; text-align: right; border-bottom: 1px solid var(--line); }
   th:first-child, td:first-child, th:nth-child(2), td:nth-child(2), th:nth-child(3), td:nth-child(3)
@@ -1158,8 +1163,8 @@ full breakdown of everything you've entered stays on your own private dashboard.
 </table></div>
 
 <h2>Connected strategies</h2>
-<div class="card scroll"><table id="slots">
-  <thead><tr><th>Player</th><th>College</th><th>Bot</th><th>Status</th></tr></thead>
+<div class="card scroll scroll-tall"><table id="slots">
+  <thead><tr><th>Player</th><th>College</th><th>Bot</th><th>Status</th><th>Connected</th><th># Active</th></tr></thead>
   <tbody></tbody>
 </table></div>
 
@@ -1224,8 +1229,9 @@ async function refresh(){
     const stale = p.stale ? ' <span class="stale-badge" title="Running an older matchup.py — still works fine, just missing recent features">stale bundle</span>' : '';
     return `<tr><td class="player-name">${p.name}</td><td class="college">${p.college||'—'}</td>`+
       `<td class="mono">${p.bot}</td>`+
-      `<td><span class="status-pill"><span class="dot ${dot}"></span>${p.status}</span>${stale}</td></tr>`;
-  }).join('') || '<tr class="empty"><td colspan=4>Nobody connected right now.</td></tr>';
+      `<td><span class="status-pill"><span class="dot ${dot}"></span>${p.status}</span>${stale}</td>`+
+      `<td>${fmtAgo(p.connected_at)}</td><td>${p.num_active}</td></tr>`;
+  }).join('') || '<tr class="empty"><td colspan=6>Nobody connected right now.</td></tr>';
 
   document.querySelector('#matches tbody').innerHTML = d.recent_matches.map(m=>
     `<tr><td>${fmtAgo(m.ts)}</td><td class="mono">${m.a}</td><td>${fmtPnl(m.pnl_a)}</td>`+

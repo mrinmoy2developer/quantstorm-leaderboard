@@ -852,11 +852,25 @@ class Ladder:
             except Exception as e:
                 print(f"[scheduler] error: {e}")
 
+    def _matches_so_far(self, session: Session, filename: str) -> int:
+        row = self.board.entrants.get(entrant_id(session.name, filename))
+        return row["matches"] if row else 0
+
     async def _schedule_missing(self):
         ready = [
             (s, f) for s in self.sessions.values() if s.connected
             for f, slot in s.slots.items() if slot.status == "ready" and not slot.busy
         ]
+        # Fewest-matches-first: a brand new entrant behind combinations() of
+        # every already-established pair could wait ticks before its first
+        # game runs, at exactly the moment it most needs matches to reach
+        # MIN_MATCHES_FOR_RANK. Sorting first means combinations() naturally
+        # produces low-match pairs earlier, and since tasks acquire
+        # match_semaphore in the order they're created, they get first crack
+        # at the available concurrency each tick. Best-effort, not a hard
+        # guarantee -- a semaphore already saturated by matches queued in an
+        # earlier tick still drains in that tick's order first.
+        ready.sort(key=lambda sf: self._matches_so_far(*sf))
         for (sa, fa), (sb, fb) in itertools.combinations(ready, 2):
             ida, idb = entrant_id(sa.name, fa), entrant_id(sb.name, fb)
             if ida == idb:

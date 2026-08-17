@@ -1315,7 +1315,7 @@ full breakdown of everything you've entered stays on your own private dashboard.
   <tbody></tbody>
 </table></div></details>
 
-<details class="table-section">
+<details class="table-section" open>
 <summary>Connected strategies</summary>
 <div class="card table-scroll"><table id="slots">
   <thead><tr><th>Player</th><th>College</th><th>Bot</th><th>Status</th><th>Connected</th></tr></thead>

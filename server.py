@@ -239,6 +239,20 @@ class RemoteBotProxy:
         self.seat = seat
         self.powers_won: list[dict] = []
         self._deal_auction_log: list[dict] = []
+        # engine.BotWrapper._call() reads this via getattr(bot, "last_call_ms",
+        # None) and, when present, uses it INSTEAD OF wall-clock elapsed time
+        # for hard-time-limit violation counting -- see the comment at its
+        # call site. Without it, the engine charges the full network round
+        # trip to a real participant's machine against the 50ms hard limit,
+        # which is virtually never under 50ms for a WAN connection: every
+        # match was racking up 5+ violations within a deal or two and
+        # forfeiting outright (250 PnL transferred), long before the bot
+        # itself did anything wrong. The true per-call compute-time limit is
+        # already enforced correctly on the participant's own machine, inside
+        # their sandbox.py worker -- this must not be re-checked, incorrectly,
+        # against network latency it has no way to distinguish from real
+        # bot slowness.
+        self.last_call_ms = 0.0
 
     def _call(self, method: str, args: dict):
         args = {**args, "filename": self.filename}
@@ -246,13 +260,25 @@ class RemoteBotProxy:
         try:
             return cf.result(timeout=RPC_TIMEOUT_S + 2.0)
         except FutureTimeoutError:
+            # The client genuinely never answered within a generous
+            # allowance -- this is the one case that legitimately resembles
+            # "the call exceeded its time budget."
             cf.cancel()
             raise engine.BotTimeout(
                 f"{self.session.name}/{self.filename}: no reply to {method}() "
                 f"within {RPC_TIMEOUT_S:.0f}s"
             )
         except Exception as e:
-            raise engine.BotTimeout(f"{self.session.name}/{self.filename}: {method}() failed: {e}")
+            # The client DID answer, just with an ordinary error -- its own
+            # bot crashed, failed to construct for this deal, returned
+            # something malformed, etc, reported honestly as ok:false. This
+            # must NOT become a BotTimeout: that also counts as a hard-time-
+            # limit violation on engine.BotWrapper's own timer, and five of
+            # those forfeits the WHOLE MATCH (250 PnL) over something that
+            # was never about time. A plain exception gets exactly the
+            # documented per-call fallback instead, which is what this
+            # actually is.
+            raise RuntimeError(f"{self.session.name}/{self.filename}: {method}() failed: {e}")
 
     def _serialize(self, obs) -> dict:
         d = protocol.serialize_obs(obs)

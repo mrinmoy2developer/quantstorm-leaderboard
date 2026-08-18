@@ -105,7 +105,7 @@ CURRENT_CLIENT_VERSION = 2
 #: swingy result can put a mediocre bot at #1 or a strong one at the bottom.
 #: Below this many matches an entrant shows up as "provisional" instead of
 #: in the ranked standings.
-MIN_MATCHES_FOR_RANK = 10
+MIN_MATCHES_FOR_RANK = 8
 
 #: A bot at or below this match count is "low" and entitled to the reserved
 #: slots above. Same figure as MIN_MATCHES_FOR_RANK: below it a strategy

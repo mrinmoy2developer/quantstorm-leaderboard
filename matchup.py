@@ -139,12 +139,14 @@ class RunningStrategy:
 
 
 class Client:
-    def __init__(self, server: str, name: str, college: str, roll_number: str, strategies_dir: Path):
+    def __init__(self, server: str, name: str, college: str, roll_number: str,
+                 strategies_dir: Path, capacity: int = 2):
         self.server = server
         self.name = name
         self.college = college
         self.roll_number = roll_number
         self.strategies_dir = strategies_dir
+        self.capacity = max(1, min(10, capacity))
         # filename -> RunningStrategy, one per concurrently-active slot.
         # Populated on match_start, torn down on match_end/unload_bot.
         self.running: dict[str, RunningStrategy] = {}
@@ -362,6 +364,7 @@ class Client:
                             "type": "hello", "name": self.name, "college": self.college,
                             "roll_number": self.roll_number, "client_version": CLIENT_VERSION,
                             "capabilities": self.capabilities(),
+                            "capacity": self.capacity,
                             "bots": bots,
                         })
 
@@ -423,6 +426,9 @@ def main():
     ap = argparse.ArgumentParser(description="Divided Oracle ladder client")
     ap.add_argument("--strategies", required=True,
                      help="directory containing your strategies/*.py")
+    ap.add_argument("--capacity", type=int,
+                    default=int(os.environ.get("QUANTSTORM_CLIENT_CAPACITY", "2")),
+                    help="concurrent selected strategies this machine can sustain (default: 2)")
     args = ap.parse_args()
 
     strategies_dir = Path(args.strategies).resolve()
@@ -448,7 +454,8 @@ def main():
         print("note: no '# Roll Number:' found — the server can't tell you apart from someone "
               "else with the same name and college without it. Fill it in when you can.")
 
-    client = Client(SERVER_URL, meta["name"], meta["college"], meta["roll_number"], strategies_dir)
+    client = Client(SERVER_URL, meta["name"], meta["college"], meta["roll_number"],
+                    strategies_dir, args.capacity)
     try:
         asyncio.run(client.run())
     except KeyboardInterrupt:

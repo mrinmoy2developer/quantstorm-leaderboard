@@ -38,11 +38,13 @@ Run:
 from __future__ import annotations
 
 import argparse
+from collections import deque
 from contextlib import asynccontextmanager
 import asyncio
 import io
 import itertools
 import json
+import math
 import os
 import random
 import sys
@@ -77,6 +79,11 @@ STATE_FILE = LADDER_DIR / "leaderboard_data.json"
 RPC_TIMEOUT_S = 8.0          # generous network/IPC allowance, NOT the 50ms game limit
 ROUND_INTERVAL_S = 15.0      # how often the auto-scheduler looks for missing pairings
 MAX_ACTIVE_SLOTS = 10        # strategies one connection may run concurrently; rest queue
+RPC_METRIC_WINDOW = 512
+MATCH_METRIC_WINDOW = 256
+SLOW_RPC_P95_MS = 1_000.0
+SLOW_RPC_MIN_SAMPLES = 20
+RESERVED_FAST_SLOTS = 2
 
 # A local sandbox can occasionally exceed its usual budget during cold starts
 # or garbage collection.  Keep the engine's per-call 50ms hard stop, but allow
@@ -127,6 +134,23 @@ PLACEHOLDER_ROLL_NUMBER = "REF-000"
 
 def entrant_id(player: str, filename: str) -> str:
     return f"{player}::{Path(filename).stem}"
+
+
+def percentile(values, percentile_: float) -> float | None:
+    """Nearest-rank percentile for small rolling operational windows."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, math.ceil(len(ordered) * percentile_) - 1))
+    return round(float(ordered[index]), 2)
+
+
+def timing_summary(values) -> dict:
+    return {
+        "count": len(values),
+        "p50_ms": percentile(values, 0.50),
+        "p95_ms": percentile(values, 0.95),
+    }
 
 
 def _match_detail(result, seat: int, powers_won: list) -> dict:
@@ -183,18 +207,26 @@ class Session:
     roll_number: str = ""
     client_version: int = 0    # 0 = older bundle, predates this field entirely
     capabilities: set[str] = field(default_factory=set)
+    capacity: int = MAX_ACTIVE_SLOTS  # legacy clients retain their old scheduling behavior
     bots: list = field(default_factory=list)          # metadata only: filenames discovered locally
     slots: dict = field(default_factory=dict)          # filename -> Slot, one per selected strategy
     connected_at: float = field(default_factory=time.time)
     connected: bool = True
     pending: dict = field(default_factory=dict)         # req_id -> asyncio.Future
     _counter: itertools.count = field(default_factory=itertools.count)
+    rpc_latencies_ms: deque = field(default_factory=lambda: deque(maxlen=RPC_METRIC_WINDOW))
+    rpc_calls: int = 0
+    rpc_timeouts: int = 0
 
     def active_slot_count(self) -> int:
         return sum(1 for s in self.slots.values() if s.status in ("validating", "ready"))
 
     def supports(self, capability: str) -> bool:
         return capability in self.capabilities
+
+    def rpc_metrics(self) -> dict:
+        return {**timing_summary(self.rpc_latencies_ms), "calls": self.rpc_calls,
+                "timeouts": self.rpc_timeouts}
 
     async def send(self, msg: dict):
         if not self.connected:
@@ -209,9 +241,16 @@ class Session:
         req_id = str(next(self._counter))
         fut = self.loop.create_future()
         self.pending[req_id] = fut
+        started = time.perf_counter()
+        self.rpc_calls += 1
         try:
             await self.send({"type": "rpc", "id": req_id, "method": method, "args": args})
-            return await asyncio.wait_for(fut, timeout=timeout_s)
+            result = await asyncio.wait_for(fut, timeout=timeout_s)
+            self.rpc_latencies_ms.append((time.perf_counter() - started) * 1_000)
+            return result
+        except asyncio.TimeoutError:
+            self.rpc_timeouts += 1
+            raise
         finally:
             self.pending.pop(req_id, None)
 
@@ -243,11 +282,13 @@ class RemoteBotProxy:
     per deal by the engine, which is what flushes it.
     """
 
-    def __init__(self, session: Session, loop: asyncio.AbstractEventLoop, filename: str, seat: int):
+    def __init__(self, session: Session, loop: asyncio.AbstractEventLoop, filename: str, seat: int,
+                 match_id: str | None = None):
         self.session = session
         self.loop = loop
         self.filename = filename
         self.seat = seat
+        self.match_id = match_id
         self.powers_won: list[dict] = []
         self._deal_auction_log: list[dict] = []
         # engine.BotWrapper._call() reads this via getattr(bot, "last_call_ms",
@@ -266,7 +307,7 @@ class RemoteBotProxy:
         self.last_call_ms = 0.0
 
     def _call(self, method: str, args: dict):
-        args = {**args, "filename": self.filename}
+        args = {**args, "filename": self.filename, "_ladder_match_id": self.match_id}
         cf = asyncio.run_coroutine_threadsafe(self.session.rpc(method, args), self.loop)
         try:
             return cf.result(timeout=RPC_TIMEOUT_S + 2.0)
@@ -665,13 +706,49 @@ class Ladder:
         self.max_concurrent = max_concurrent
         self.match_semaphore: asyncio.Semaphore | None = None
         self.high_match_semaphore: asyncio.Semaphore | None = None
+        self.slow_match_semaphore: asyncio.Semaphore | None = None
         self.live_matches: dict = {}   # match_id -> {"a":..., "b":...}
         # Pairings already admitted to the scheduler.  Keeping these bounded
         # prevents every 15-second scheduler tick from adding another copy of
         # the same slow match behind a semaphore.
         self.pending_matches: set[tuple[str, str]] = set()
-        self.pending_entrants: set[str] = set()
+        self.pending_slots: set[tuple[str, str]] = set()
+        self.pending_sessions: dict[str, int] = {}
+        self.pending_slow_matches: set[tuple[str, str]] = set()
+        self.queue_wait_ms: deque = deque(maxlen=MATCH_METRIC_WINDOW)
+        self.match_wall_ms: deque = deque(maxlen=MATCH_METRIC_WINDOW)
+        self.engine_time_ms: deque = deque(maxlen=MATCH_METRIC_WINDOW)
+        # Optional in-process integrations, such as rl_recorder, can publish
+        # snapshots here without making the public server depend on them.
+        self.metric_providers: dict[str, callable] = {}
+        self.match_result_listeners: list[callable] = []
         self.client_zip = build_client_zip()
+
+    @staticmethod
+    def _person_key(session: Session) -> tuple:
+        if session.roll_number and session.roll_number != PLACEHOLDER_ROLL_NUMBER:
+            return ("roll", session.roll_number)
+        return ("display", session.name, session.college)
+
+    def _session_load(self, session: Session) -> int:
+        return self.pending_sessions.get(session.token, 0)
+
+    @staticmethod
+    def _is_slow(session: Session) -> bool:
+        samples = session.rpc_latencies_ms
+        return (len(samples) >= SLOW_RPC_MIN_SAMPLES
+                and (percentile(samples, 0.95) or 0.0) >= SLOW_RPC_P95_MS)
+
+    def _pair_is_slow(self, sa: Session, sb: Session) -> bool:
+        return self._is_slow(sa) or self._is_slow(sb)
+
+    def _notify_match_result(self, **event) -> None:
+        """Best-effort hooks; observability must never break a scored game."""
+        for listener in tuple(self.match_result_listeners):
+            try:
+                listener(event)
+            except Exception as exc:
+                print(f"[metrics] match listener failed: {exc}")
 
     async def relay_p2p_signal(self, sender: Session, data: dict) -> None:
         """Forward WebRTC signaling only to the other seat of a live match.
@@ -736,10 +813,15 @@ class Ladder:
                         str(capability) for capability in data.get("capabilities", [])
                         if isinstance(capability, str) and len(capability) <= 64
                     }
+                    try:
+                        capacity = int(data.get("capacity", MAX_ACTIVE_SLOTS))
+                    except (TypeError, ValueError):
+                        capacity = 1
                     session = Session(name=canon_name, token=token, ws=ws, loop=loop,
                                        college=canon_college, roll_number=roll_number,
                                        client_version=client_version,
                                        capabilities=capabilities,
+                                       capacity=max(1, min(MAX_ACTIVE_SLOTS, capacity)),
                                        bots=list(data.get("bots", []))[:200])
                     self.sessions[token] = session
                     await session.send({
@@ -818,6 +900,8 @@ class Ladder:
                     "stale": s.client_version < CURRENT_CLIENT_VERSION,
                     "connected_at": s.connected_at,
                     "num_active": len(s.slots),
+                    "capacity": s.capacity,
+                    "rpc": s.rpc_metrics(),
                 })
 
         persisted_ids = {
@@ -832,6 +916,12 @@ class Ladder:
             for slot in s.slots.values() if slot.status == "invalid"
         )
         ranked, provisional = self.board.standings_public()
+        provider_metrics = {}
+        for name, provider in tuple(self.metric_providers.items()):
+            try:
+                provider_metrics[name] = provider()
+            except Exception as exc:
+                provider_metrics[name] = {"error": str(exc)}
 
         return web.json_response({
             "standings": ranked,
@@ -842,6 +932,15 @@ class Ladder:
             "matches_per_pair": self.matches_per_pair,
             "max_active_slots": MAX_ACTIVE_SLOTS,
             "min_matches_for_rank": MIN_MATCHES_FOR_RANK,
+            "metrics": {
+                "queue_wait": timing_summary(self.queue_wait_ms),
+                "match_wall": timing_summary(self.match_wall_ms),
+                "engine": timing_summary(self.engine_time_ms),
+                "slow_rpc_p95_ms": SLOW_RPC_P95_MS,
+                "slow_sessions": sum(self._is_slow(s) for s in self.sessions.values()
+                                     if s.connected),
+                "providers": provider_metrics,
+            },
             "stats": {
                 "entrants": len(persisted_ids | connected_ids),
                 "ranked": len(ranked),
@@ -849,6 +948,7 @@ class Ladder:
                 "rejected": rejected,
                 "active_matches": len(self.live_matches),
                 "pending_matches": len(self.pending_matches),
+                "pending_slow_matches": len(self.pending_slow_matches),
                 "low_match_capacity": self.max_concurrent,
                 "high_match_capacity": max(1, self.max_concurrent - RESERVED_LOW_SLOTS),
             },
@@ -960,59 +1060,77 @@ class Ladder:
         row = self.board.entrants.get(entrant_id(session.name, filename))
         return row["matches"] if row else 0
 
-    def _schedule_key(self, sf) -> tuple:
-        matches = self._matches_so_far(*sf)
-        return (0, matches) if matches == 0 else (1, matches)
+    def _pair_schedule_key(self, sa: Session, fa: str, sb: Session, fb: str) -> tuple:
+        """New track records first; known-slow links run in the slow lane."""
+        matches_a, matches_b = self._matches_so_far(sa, fa), self._matches_so_far(sb, fb)
+        low = matches_a <= LOW_MATCH_THRESHOLD or matches_b <= LOW_MATCH_THRESHOLD
+        return (0 if low else 1, 1 if self._pair_is_slow(sa, sb) else 0,
+                min(matches_a, matches_b), max(matches_a, matches_b))
 
     async def _schedule_missing(self):
         ready = [
             (s, f) for s in self.sessions.values() if s.connected
             for f, slot in s.slots.items() if slot.status == "ready" and not slot.busy
         ]
-        # Zero-matches-first, then fewest-matches-first: a connected-and-ready
-        # entrant that has never completed a game -- the dashboard's "In queue"
-        # bucket -- must not wait behind every already-established pair, at
-        # exactly the moment it most needs matches to reach MIN_MATCHES_FOR_RANK.
-        # Sorting first means combinations() naturally produces these pairs
-        # earlier, and since tasks acquire match_semaphore in the order they're
-        # created, they get first crack at the available concurrency each tick.
-        # Best-effort, not a hard guarantee -- a semaphore already saturated by
-        # matches queued in an earlier tick still drains in that tick's order
-        # first.
-        ready.sort(key=self._schedule_key)
-        # Admit at most one pending match per entrant and never more than the
-        # configured worker count.  A match can take minutes, so admitting
-        # every combination every 15 seconds otherwise creates a large pile
-        # of duplicate tasks waiting behind the semaphores.
+        # Keep the queue bounded to executable work.  ``pending_sessions``
+        # counts both a semaphore wait and an active match, so a client that
+        # advertises capacity=2 can run two *different* selected bots but no
+        # more. Older clients advertise nothing and safely default to one.
         capacity = max(0, self.max_concurrent - len(self.pending_matches))
-        started = 0
+        candidates = []
         for (sa, fa), (sb, fb) in itertools.combinations(ready, 2):
-            if started >= capacity:
-                break
+            if self._person_key(sa) == self._person_key(sb):
+                # Variants from one participant are useful for local testing,
+                # but must not manufacture ranked ladder track records.
+                continue
             ida, idb = entrant_id(sa.name, fa), entrant_id(sb.name, fb)
             if ida == idb:
-                # Same player, same file selected twice over -- not a match.
-                continue
-            if ida in self.pending_entrants or idb in self.pending_entrants:
                 continue
             if self.board.games_played(ida, idb) >= self.matches_per_pair:
                 continue
             pair_key = tuple(sorted((ida, idb)))
             if pair_key in self.pending_matches:
                 continue
+            candidates.append((self._pair_schedule_key(sa, fa, sb, fb), sa, fa, sb, fb,
+                               ida, idb, pair_key, self._pair_is_slow(sa, sb)))
+
+        candidates.sort(key=lambda candidate: candidate[0])
+        started = 0
+        slow_limit = max(0, self.max_concurrent - RESERVED_FAST_SLOTS)
+        for _, sa, fa, sb, fb, ida, idb, pair_key, slow in candidates:
+            if started >= capacity:
+                break
+            slot_a, slot_b = (sa.token, fa), (sb.token, fb)
+            if slot_a in self.pending_slots or slot_b in self.pending_slots:
+                continue
+            if self._session_load(sa) >= sa.capacity or self._session_load(sb) >= sb.capacity:
+                continue
+            if slow and len(self.pending_slow_matches) >= slow_limit:
+                continue
             self.pending_matches.add(pair_key)
-            self.pending_entrants.update((ida, idb))
+            self.pending_slots.update((slot_a, slot_b))
+            self.pending_sessions[sa.token] = self._session_load(sa) + 1
+            self.pending_sessions[sb.token] = self._session_load(sb) + 1
+            if slow:
+                self.pending_slow_matches.add(pair_key)
             asyncio.create_task(self._run_scheduled_match(
-                sa, fa, sb, fb, pair_key, ida, idb))
+                sa, fa, sb, fb, pair_key, slow, time.perf_counter()))
             started += 1
 
-    async def _run_scheduled_match(self, sa, fa, sb, fb, pair_key, ida, idb):
+    async def _run_scheduled_match(self, sa, fa, sb, fb, pair_key, slow, queued_at):
         try:
-            await self.run_match(sa, fa, sb, fb)
+            await self.run_match(sa, fa, sb, fb, queued_at=queued_at, slow_match=slow)
         finally:
             self.pending_matches.discard(pair_key)
-            self.pending_entrants.discard(ida)
-            self.pending_entrants.discard(idb)
+            self.pending_slots.discard((sa.token, fa))
+            self.pending_slots.discard((sb.token, fb))
+            for session in (sa, sb):
+                load = self.pending_sessions.get(session.token, 0) - 1
+                if load > 0:
+                    self.pending_sessions[session.token] = load
+                else:
+                    self.pending_sessions.pop(session.token, None)
+            self.pending_slow_matches.discard(pair_key)
             # The next match should start as soon as a slot becomes free,
             # not up to ROUND_INTERVAL_S later. _schedule_missing sorts
             # zero-match entrants first, so this gives new participants the
@@ -1023,22 +1141,36 @@ class Ladder:
                 print(f"[scheduler] completion-triggered scheduling failed: {e}")
 
     @asynccontextmanager
-    async def _match_capacity(self, low_match: bool):
+    async def _match_capacity(self, low_match: bool, slow_match: bool):
         # The shared semaphore enforces the total -- the category semaphore
         # only reserves headroom for low-track-record entrants.  The old code
         # acquired independent semaphores, allowing low + established games
         # to exceed max_concurrent.
         async with self.match_semaphore:
-            if low_match:
-                yield
-            else:
-                async with self.high_match_semaphore:
+            async with self._slow_lane(slow_match):
+                if low_match:
                     yield
+                else:
+                    async with self.high_match_semaphore:
+                        yield
 
-    async def run_match(self, sa: Session, fa: str, sb: Session, fb: str):
+    @asynccontextmanager
+    async def _slow_lane(self, slow_match: bool):
+        if slow_match:
+            async with self.slow_match_semaphore:
+                yield
+        else:
+            yield
+
+    async def run_match(self, sa: Session, fa: str, sb: Session, fb: str,
+                        queued_at: float | None = None, slow_match: bool | None = None):
         low_match = (self._matches_so_far(sa, fa) <= LOW_MATCH_THRESHOLD
                      or self._matches_so_far(sb, fb) <= LOW_MATCH_THRESHOLD)
-        async with self._match_capacity(low_match):
+        slow_match = self._pair_is_slow(sa, sb) if slow_match is None else slow_match
+        async with self._match_capacity(low_match, slow_match):
+            admitted_at = time.perf_counter()
+            if queued_at is not None:
+                self.queue_wait_ms.append((admitted_at - queued_at) * 1_000)
             slot_a, slot_b = sa.slots.get(fa), sb.slots.get(fb)
             if slot_a is None or slot_b is None:
                 return  # deselected between scheduling and now
@@ -1054,6 +1186,7 @@ class Ladder:
                 "a": ida, "b": idb, "started": time.time(),
                 "tokens": (sa.token, sb.token), "p2p": direct_capable,
             }
+            match_started_at = time.perf_counter()
             try:
                 overrides = protocol.config_overrides(self.config)
                 await sa.send({"type": "match_start", "match_id": match_id, "filename": fa,
@@ -1071,24 +1204,31 @@ class Ladder:
                                    "initiator": False, "mode": "sidecar"})
 
                 loop = asyncio.get_running_loop()
-                proxy_a = RemoteBotProxy(sa, loop, fa, seat=0)
-                proxy_b = RemoteBotProxy(sb, loop, fb, seat=1)
+                proxy_a = RemoteBotProxy(sa, loop, fa, seat=0, match_id=match_id)
+                proxy_b = RemoteBotProxy(sb, loop, fb, seat=1, match_id=match_id)
                 seed = random.randrange(2 ** 32)
 
+                engine_started_at = time.perf_counter()
                 result = await loop.run_in_executor(
                     self.executor, self._play_sync, proxy_a, proxy_b, seed, ida, idb,
                 )
+                engine_elapsed_ms = (time.perf_counter() - engine_started_at) * 1_000
+                self.engine_time_ms.append(engine_elapsed_ms)
                 proxy_a.flush_deal_powers()  # last deal's tape never got flushed by a next reset()
                 proxy_b.flush_deal_powers()
 
+                detail_a = _match_detail(result, 0, proxy_a.powers_won)
+                detail_b = _match_detail(result, 1, proxy_b.powers_won)
                 self.board.record(
                     ida, sa.name, sa.college, sa.roll_number, fa,
                     idb, sb.name, sb.college, sb.roll_number, fb,
                     result.pnl[0], result.pnl[1],
                     result.bot_a_warnings, result.bot_b_warnings,
-                    detail_a=_match_detail(result, 0, proxy_a.powers_won),
-                    detail_b=_match_detail(result, 1, proxy_b.powers_won),
+                    detail_a=detail_a, detail_b=detail_b,
                 )
+                self._notify_match_result(match_id=match_id, seed=seed, name_a=ida,
+                                          name_b=idb, detail_a=detail_a, detail_b=detail_b,
+                                          forfeits=result.forfeits)
                 await sa.send({"type": "match_end", "match_id": match_id, "filename": fa,
                                 "opponent": sb.name, "pnl": result.pnl[0]})
                 await sb.send({"type": "match_end", "match_id": match_id, "filename": fb,
@@ -1099,6 +1239,7 @@ class Ladder:
                     await s.send({"type": "match_end", "match_id": match_id, "filename": f,
                                    "opponent": opp, "error": str(e)})
             finally:
+                self.match_wall_ms.append((time.perf_counter() - match_started_at) * 1_000)
                 self.live_matches.pop(match_id, None)
                 if slot_a is not None:
                     slot_a.busy = False
@@ -1851,6 +1992,8 @@ def build_app(ladder: Ladder) -> web.Application:
         ladder.match_semaphore = asyncio.Semaphore(ladder.max_concurrent)
         ladder.high_match_semaphore = asyncio.Semaphore(
             max(1, ladder.max_concurrent - RESERVED_LOW_SLOTS))
+        ladder.slow_match_semaphore = asyncio.Semaphore(
+            max(1, ladder.max_concurrent - RESERVED_FAST_SLOTS))
         app["scheduler_task"] = asyncio.create_task(ladder.scheduler_loop())
 
     app.on_startup.append(on_startup)

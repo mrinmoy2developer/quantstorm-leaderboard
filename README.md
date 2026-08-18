@@ -52,6 +52,11 @@ pip install aiohttp
 python matchup.py --strategies /path/to/your/strategies
 ```
 
+Use `--capacity N` (or `QUANTSTORM_CLIENT_CAPACITY=N`) to tell the scheduler
+how many different selected strategies this machine can sustain at once. New
+bundles default to two; older bundles remain compatible and retain the
+server's previous, unconstrained behavior.
+
 There's no `--name` flag — every `strategies/*.py` is required by the
 competition rulebook to open with
 
@@ -115,6 +120,12 @@ TLS in front of it via `certbot --nginx`.
   sidecar, so the normal WebSocket path remains authoritative for every
   ranked decision and result. This gives us a safe compatibility and NAT test
   path before enabling the required signed-action transcript replay.
+- **Scheduling is capacity- and latency-aware.** The server never pairs two
+  strategies belonging to the same roll-number identity, honors each modern
+  client's advertised capacity, and puts connections with sustained RPC p95
+  above one second in a capped slow lane. `/api/state` exposes rolling
+  per-client RPC p50/p95, queue wait, match wall-time, and engine-time
+  metrics for operations tooling.
 
 ## License
 

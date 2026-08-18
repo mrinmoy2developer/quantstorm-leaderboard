@@ -38,6 +38,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import csv
 from collections import deque
 from contextlib import asynccontextmanager
 import asyncio
@@ -964,6 +965,25 @@ class Ladder:
             headers={"Content-Disposition": 'attachment; filename="quantstorm-ladder-client.zip"'},
         )
 
+    async def download_leaderboard_csv(self, request: web.Request) -> web.Response:
+        """Download the current public ranked and provisional rows as CSV."""
+        ranked, provisional = self.board.standings_public()
+        fields = ["rank", "status", "entrant_id", "player", "college", "roll_number",
+                  "bot", "matches", "avg_pnl", "pnl", "wins", "losses", "draws",
+                  "first_seen", "last_seen"]
+        output = io.StringIO(newline="")
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for rank, row in enumerate(ranked, 1):
+            writer.writerow({**row, "rank": rank, "status": "ranked"})
+        for row in provisional:
+            writer.writerow({**row, "rank": "", "status": "provisional"})
+        return web.Response(
+            text=output.getvalue(),
+            content_type="text/csv",
+            headers={"Content-Disposition": 'attachment; filename="quantstorm-leaderboard.csv"'},
+        )
+
     # ── HTTP: per-session bot picker ────────────────────────
 
     async def player_page(self, request: web.Request) -> web.Response:
@@ -1411,7 +1431,7 @@ INDEX_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 
 <header>
   <h1>Divided <span class="ring">Oracle</span> — Open Leaderboard</h1>
-  <span class="live-badge"><span class="live-dot"></span>live, updates every few seconds</span>
+  <span><a href="/download/leaderboard.csv">Download CSV</a> &nbsp; <span class="live-badge"><span class="live-dot"></span>live, updates every few seconds</span></span>
 </header>
 <details class="submit" open>
   <summary>How to submit &amp; enter the ladder</summary>
@@ -1983,6 +2003,7 @@ def build_app(ladder: Ladder) -> web.Application:
     app.router.add_get("/ws", ladder.ws_handler)
     app.router.add_get("/", ladder.index)
     app.router.add_get("/download/matchup-client.zip", ladder.download_client)
+    app.router.add_get("/download/leaderboard.csv", ladder.download_leaderboard_csv)
     app.router.add_get("/api/state", ladder.state_json)
     app.router.add_get("/player/{token}", ladder.player_page)
     app.router.add_get("/player/{token}/state", ladder.player_state)

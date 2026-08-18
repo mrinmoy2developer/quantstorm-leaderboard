@@ -69,6 +69,7 @@ import engine  # noqa: E402
 from game_config import GameConfig  # noqa: E402
 
 import protocol  # noqa: E402
+import p2p  # noqa: E402
 
 LADDER_DIR = Path(__file__).resolve().parent
 STATE_FILE = LADDER_DIR / "leaderboard_data.json"
@@ -96,7 +97,7 @@ RESERVED_LOW_SLOTS = 5
 #: informational, never enforced: a mismatched or missing version (every
 #: bundle downloaded before this field existed) still connects and plays
 #: exactly as before, just shows a "stale bundle" tag on the dashboard.
-CURRENT_CLIENT_VERSION = 2
+CURRENT_CLIENT_VERSION = 3
 
 #: Matches an entrant needs before their PnL/match is trusted enough to rank
 #: on. A late joiner isn't disadvantaged by the SCHEDULE -- _schedule_missing
@@ -181,6 +182,7 @@ class Session:
     college: str = ""
     roll_number: str = ""
     client_version: int = 0    # 0 = older bundle, predates this field entirely
+    capabilities: set[str] = field(default_factory=set)
     bots: list = field(default_factory=list)          # metadata only: filenames discovered locally
     slots: dict = field(default_factory=dict)          # filename -> Slot, one per selected strategy
     connected_at: float = field(default_factory=time.time)
@@ -190,6 +192,9 @@ class Session:
 
     def active_slot_count(self) -> int:
         return sum(1 for s in self.slots.values() if s.status in ("validating", "ready"))
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.capabilities
 
     async def send(self, msg: dict):
         if not self.connected:
@@ -577,6 +582,7 @@ class Leaderboard:
 
 _CLIENT_FILES = [
     ("matchup.py", LADDER_DIR / "matchup.py"),
+    ("p2p.py", LADDER_DIR / "p2p.py"),
     ("protocol.py", LADDER_DIR / "protocol.py"),
     ("engine.py", LADDER_DIR.parent / "engine.py"),
     ("game_config.py", LADDER_DIR.parent / "game_config.py"),
@@ -620,6 +626,12 @@ them.
 matchup.py reconnects automatically (with backoff) if the connection drops
 or the server restarts, and re-enters whatever you had selected -- no
 manual restart needed.
+
+Optional P2P transport is deliberately disabled by default.  It requires
+``pip install aiortc`` plus ``QUANTSTORM_ENABLE_P2P=1`` and a server started
+with ``--enable-p2p-signaling``.  It is only a direct-channel sidecar today;
+all ranked game actions and results still use the authoritative WebSocket
+path until signed transcript replay is enabled on the server.
 """
 
 
@@ -633,7 +645,8 @@ def build_client_zip() -> bytes:
 
 
 class Ladder:
-    def __init__(self, n_deals: int, max_concurrent: int, matches_per_pair: int):
+    def __init__(self, n_deals: int, max_concurrent: int, matches_per_pair: int,
+                 enable_p2p_signaling: bool = False):
         # Keyed by connection token, NOT player name: one player may run
         # several matchup.py processes at once, each entering a different
         # strategy file, so several Sessions legitimately share a name.
@@ -643,6 +656,11 @@ class Ladder:
         self.config = GameConfig(MAX_TIME_VIOLATIONS=LADDER_MAX_TIME_VIOLATIONS)
         self.n_deals = n_deals
         self.matches_per_pair = matches_per_pair
+        # Disabled by default: it is safe to deploy this code before clients
+        # have the optional aiortc dependency.  Even when enabled, the direct
+        # channel is a non-authoritative side channel until transcript replay
+        # is activated in a later release.
+        self.enable_p2p_signaling = enable_p2p_signaling
         self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
         self.max_concurrent = max_concurrent
         self.match_semaphore: asyncio.Semaphore | None = None
@@ -654,6 +672,27 @@ class Ladder:
         self.pending_matches: set[tuple[str, str]] = set()
         self.pending_entrants: set[str] = set()
         self.client_zip = build_client_zip()
+
+    async def relay_p2p_signal(self, sender: Session, data: dict) -> None:
+        """Forward WebRTC signaling only to the other seat of a live match.
+
+        A client never chooses a recipient token.  This prevents it from
+        using the ladder as an arbitrary signaling relay or injecting SDP/ICE
+        into an unrelated participant's connection.
+        """
+        if not self.enable_p2p_signaling:
+            return
+        match_id = data.get("match_id")
+        live = self.live_matches.get(match_id)
+        signal = data.get("signal")
+        if (not isinstance(match_id, str) or not p2p.valid_signal(signal)
+                or not live or sender.token not in live.get("tokens", ())):
+            return
+        peer_token = next(token for token in live["tokens"] if token != sender.token)
+        peer = self.sessions.get(peer_token)
+        if peer is None or not peer.connected or not peer.supports("p2p_signaling_v1"):
+            return
+        await peer.send({"type": "p2p_signal", "match_id": match_id, "signal": signal})
 
     # ── websocket handling ──────────────────────────────────
 
@@ -693,9 +732,14 @@ class Ladder:
                         roll_number, name, college)
 
                     token = uuid.uuid4().hex[:16]
+                    capabilities = {
+                        str(capability) for capability in data.get("capabilities", [])
+                        if isinstance(capability, str) and len(capability) <= 64
+                    }
                     session = Session(name=canon_name, token=token, ws=ws, loop=loop,
                                        college=canon_college, roll_number=roll_number,
                                        client_version=client_version,
+                                       capabilities=capabilities,
                                        bots=list(data.get("bots", []))[:200])
                     self.sessions[token] = session
                     await session.send({
@@ -749,6 +793,8 @@ class Ladder:
                             fut.set_result(data.get("value"))
                         else:
                             fut.set_exception(RuntimeError(data.get("error", "client error")))
+                elif kind == "p2p_signal":
+                    await self.relay_p2p_signal(session, data)
         finally:
             if session is not None:
                 session.connected = False
@@ -1001,13 +1047,28 @@ class Ladder:
             slot_a.busy = slot_b.busy = True
             ida, idb = entrant_id(sa.name, fa), entrant_id(sb.name, fb)
             match_id = uuid.uuid4().hex[:8]
-            self.live_matches[match_id] = {"a": ida, "b": idb, "started": time.time()}
+            direct_capable = (self.enable_p2p_signaling
+                              and sa.supports("p2p_signaling_v1")
+                              and sb.supports("p2p_signaling_v1"))
+            self.live_matches[match_id] = {
+                "a": ida, "b": idb, "started": time.time(),
+                "tokens": (sa.token, sb.token), "p2p": direct_capable,
+            }
             try:
                 overrides = protocol.config_overrides(self.config)
                 await sa.send({"type": "match_start", "match_id": match_id, "filename": fa,
                                 "opponent": sb.name, "seat": 0, "overrides": overrides})
                 await sb.send({"type": "match_start", "match_id": match_id, "filename": fb,
                                 "opponent": sa.name, "seat": 1, "overrides": overrides})
+                if direct_capable:
+                    # The data channel currently warms up alongside the
+                    # normal authoritative RPC path.  It never blocks this
+                    # match and is intentionally not used for ranked actions
+                    # until server-side transcript replay is enabled.
+                    await sa.send({"type": "p2p_prepare", "match_id": match_id,
+                                   "initiator": True, "mode": "sidecar"})
+                    await sb.send({"type": "p2p_prepare", "match_id": match_id,
+                                   "initiator": False, "mode": "sidecar"})
 
                 loop = asyncio.get_running_loop()
                 proxy_a = RemoteBotProxy(sa, loop, fa, seat=0)
@@ -1803,9 +1864,12 @@ def main():
     ap.add_argument("--n_deals", type=int, default=8, help="deals per phase per match (mirror doubles it)")
     ap.add_argument("--max_concurrent", type=int, default=3)
     ap.add_argument("--matches_per_pair", type=int, default=2)
+    ap.add_argument("--enable-p2p-signaling", action="store_true",
+                    help="opt-in WebRTC signaling sidecar; ranked games still use WS RPC")
     args = ap.parse_args()
 
-    ladder = Ladder(args.n_deals, args.max_concurrent, args.matches_per_pair)
+    ladder = Ladder(args.n_deals, args.max_concurrent, args.matches_per_pair,
+                    enable_p2p_signaling=args.enable_p2p_signaling)
     app = build_app(ladder)
     print(f"Divided Oracle ladder listening on {args.host}:{args.port}")
     print(f"  dashboard: http://{args.host}:{args.port}/")

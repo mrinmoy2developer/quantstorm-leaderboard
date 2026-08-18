@@ -51,7 +51,7 @@ SERVER_URL = os.environ.get("QUANTSTORM_SERVER_URL", "wss://quantstorm.mrinmoy.o
 #: participants about. Purely informational: an older or missing version
 #: still connects and plays exactly the same, the server just tags it
 #: "stale bundle" on the dashboard so the participant knows to update.
-CLIENT_VERSION = 2
+CLIENT_VERSION = 3
 
 # Works whether this file sits in ladder/ next to the rest of the repo (dev
 # layout: engine.py etc. one directory up) or standalone, as unzipped from
@@ -67,6 +67,7 @@ from game_config import GameConfig  # noqa: E402
 from sandbox import SandboxedBot  # noqa: E402
 
 import protocol  # noqa: E402
+import p2p  # noqa: E402
 
 
 def discover_bots(strategies_dir: Path) -> list[str]:
@@ -160,6 +161,12 @@ class Client:
         # keeps the (normally serial) calls for one sandbox ordered.
         self._rpc_tasks: dict[str, set[asyncio.Task]] = {}
         self._rpc_locks: dict[str, asyncio.Lock] = {}
+        # Opt-in only: direct transport is a non-authoritative side channel
+        # until the server also verifies signed action transcripts.
+        self._p2p_transports: dict[str, p2p.P2PTransport] = {}
+
+    def capabilities(self) -> list[str]:
+        return ["p2p_signaling_v1"] if p2p.p2p_enabled() else []
 
     def dashboard_url(self, dashboard_path: str) -> str:
         base = self.server.replace("wss://", "https://").replace("ws://", "http://")
@@ -209,6 +216,9 @@ class Client:
 
     async def handle_match_end(self, data: dict):
         filename = data["filename"]
+        transport = self._p2p_transports.pop(data.get("match_id", ""), None)
+        if transport is not None:
+            await transport.close()
         await self._finish_rpc_tasks(filename)
         entry = self.running.pop(filename, None)
         self._rpc_locks.pop(filename, None)
@@ -220,6 +230,37 @@ class Client:
         pnl = data.get("pnl", 0.0)
         mark = "+" if pnl >= 0 else ""
         print(f"■ {filename} vs {data.get('opponent')} finished — PnL: {mark}{pnl:.2f}")
+
+    async def handle_p2p_prepare(self, data: dict):
+        """Negotiate an optional direct channel without delaying the match."""
+        match_id = data.get("match_id")
+        if not isinstance(match_id, str) or match_id in self._p2p_transports:
+            return
+
+        async def send_signal(signal: dict):
+            await self.send({"type": "p2p_signal", "match_id": match_id, "signal": signal})
+
+        try:
+            self._p2p_transports[match_id] = await p2p.P2PTransport.start(
+                match_id, bool(data.get("initiator")), send_signal)
+            print(f"  ↔ direct channel negotiation started for {match_id}")
+        except Exception as e:
+            # Ranked actions remain on WS RPC, so a NAT/TURN failure is not
+            # a match failure and never needs a reconnect.
+            print(f"  ↔ direct channel unavailable for {match_id}; using relay ({e})")
+
+    async def handle_p2p_signal(self, data: dict):
+        match_id = data.get("match_id")
+        transport = self._p2p_transports.get(match_id)
+        signal = data.get("signal")
+        if transport is None or not p2p.valid_signal(signal):
+            return
+        try:
+            await transport.receive(signal)
+        except Exception as e:
+            print(f"  ↔ direct channel failed for {match_id}; using relay ({e})")
+            self._p2p_transports.pop(match_id, None)
+            await transport.close()
 
     # ── rpc dispatch: this is where your local bot actually plays ──
 
@@ -320,6 +361,7 @@ class Client:
                         await self.send({
                             "type": "hello", "name": self.name, "college": self.college,
                             "roll_number": self.roll_number, "client_version": CLIENT_VERSION,
+                            "capabilities": self.capabilities(),
                             "bots": bots,
                         })
 
@@ -340,6 +382,10 @@ class Client:
                                 await self.handle_unload_bot(data["filename"])
                             elif kind == "match_start":
                                 await self.handle_match_start(data)
+                            elif kind == "p2p_prepare":
+                                await self.handle_p2p_prepare(data)
+                            elif kind == "p2p_signal":
+                                await self.handle_p2p_signal(data)
                             elif kind == "rpc":
                                 self.dispatch_rpc(data)
                             elif kind == "match_end":
@@ -360,6 +406,11 @@ class Client:
                     await asyncio.gather(*pending, return_exceptions=True)
                 self._rpc_tasks.clear()
                 self._rpc_locks.clear()
+                transports = tuple(self._p2p_transports.values())
+                self._p2p_transports.clear()
+                if transports:
+                    await asyncio.gather(*(transport.close() for transport in transports),
+                                         return_exceptions=True)
                 for entry in self.running.values():
                     entry.sandboxed.close()
                 self.running.clear()

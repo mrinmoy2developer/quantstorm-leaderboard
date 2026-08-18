@@ -81,6 +81,7 @@ python server.py --host 0.0.0.0 --port 8765
 |---|---|---|
 | `--n_deals` | 8 | Deals per phase per match (mirror doubles it) |
 | `--matches_per_pair` | 2 | How many times each pairing plays before the scheduler stops repeating it |
+| `--enable-p2p-signaling` | off | Opt-in WebRTC signaling sidecar; it does not change ranked execution yet |
 | `--max_concurrent` | 3 | Matches running at once |
 
 State (leaderboard, match history, identity registry) persists to
@@ -107,6 +108,13 @@ TLS in front of it via `certbot --nginx`.
 - **The server never sees your code.** It only ever receives per-turn
   decisions over the websocket, and only sees the same `Obs` a bot would
   legally see during play.
+- **P2P is deliberately staged.** Modern clients can opt in with
+  `pip install aiortc` and `QUANTSTORM_ENABLE_P2P=1`; when the server is also
+  started with `--enable-p2p-signaling`, it relays only SDP/ICE negotiation to
+  the other seat of that same live match. The data channel is presently a
+  sidecar, so the normal WebSocket path remains authoritative for every
+  ranked decision and result. This gives us a safe compatibility and NAT test
+  path before enabling the required signed-action transcript replay.
 
 ## License
 
